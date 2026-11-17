@@ -8,6 +8,7 @@ struct NativeStorageScanner: Sendable {
     var timeout: TimeInterval = 600
     var cache: NativeScanCache? = nil
     var metadataOnly = false
+    var privacyPolicy = StoragePrivacyPolicy()
 
     enum ScanError: Error { case unsupported, malformedMetadata }
     struct Result: Codable, Sendable {
@@ -22,7 +23,7 @@ struct NativeStorageScanner: Sendable {
     func measure(path: String, cancellation: CommandCancellation? = nil,
                  onProgress: @escaping @Sendable (StorageScanProgress) -> Void = { _ in }) throws -> Result {
         let root = URL(fileURLWithPath: path).standardizedFileURL.path
-        let state = NativeScanState(root: root, timeout: timeout, cancellation: cancellation, metadataOnly: metadataOnly, onProgress: onProgress)
+        let state = NativeScanState(root: root, timeout: timeout, cancellation: cancellation, metadataOnly: metadataOnly, privacyPolicy: privacyPolicy, onProgress: onProgress)
         let fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { return state.result(rootBytes: nil, limited: true) }
         defer { close(fd) }
@@ -33,8 +34,8 @@ struct NativeStorageScanner: Sendable {
         let filesystemName = withUnsafeBytes(of: filesystem.f_fstypename) { String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self)) }
         guard filesystemName == "apfs" else { throw ScanError.unsupported }
         let ticket = cancellation?.isCancelled == true ? nil : cache?.begin(root)
-        if let ticket, let saved = cache?.candidate(ticket), !metadataOnly {
-            let validation = try NativeStorageScanner(workers: workers, timeout: timeout, metadataOnly: true)
+        if let ticket, let saved = cache?.candidate(ticket), !metadataOnly, saved.measurement.privacyPolicy == privacyPolicy.identifier(for: root) {
+            let validation = try NativeStorageScanner(workers: workers, timeout: timeout, metadataOnly: true, privacyPolicy: privacyPolicy)
                 .measure(path: root, cancellation: cancellation)
             if validation.measurement.isComplete, !validation.measurement.limitedAccess, validation.fingerprint == saved.fingerprint { return saved }
         }
@@ -89,6 +90,9 @@ struct NativeStorageScanner: Sendable {
     private static func walk(parentFD: Int32, entry: NativeEntry, path: String, top: String,
                              second: String, depth: Int, device: dev_t, state: NativeScanState) throws -> (bytes: Int64, limited: Bool) {
         guard !state.stopped, depth < 128 else { return (0, true) }
+        // This must precede openat, not merely skip entries after access has
+        // already caused macOS to request consent.
+        if state.skipForPrivacy(path) { return (0, false) }
         let fd = entry.name.withCString { openat(parentFD, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
         guard fd >= 0 else { return (0, true) }
         defer { close(fd) }
@@ -308,6 +312,9 @@ private final class NativeScanState: @unchecked Sendable {
     private var tops: [String: Int64] = [:]
     private var seconds: [String: [String: Int64]] = [:]
     private var limitedTops = Set<String>()
+    private var privacySkipped = Set<String>()
+    private let privacyPolicy: StoragePrivacyPolicy
+    private let explicitProtectedLocation: Bool
     private var files = 0
     private var largeFiles = StorageFileSample()
     private var regularFileCount = 0
@@ -316,10 +323,17 @@ private final class NativeScanState: @unchecked Sendable {
     private var failed = false
     private var fingerprint = NativeFingerprint()
     let metadataOnly: Bool
-    init(root: String, timeout: TimeInterval, cancellation: CommandCancellation?, metadataOnly: Bool, onProgress: @escaping @Sendable (StorageScanProgress) -> Void) {
+    init(root: String, timeout: TimeInterval, cancellation: CommandCancellation?, metadataOnly: Bool, privacyPolicy: StoragePrivacyPolicy, onProgress: @escaping @Sendable (StorageScanProgress) -> Void) {
         self.root = root; self.deadline = Date().addingTimeInterval(timeout)
         self.cancellation = cancellation; self.onProgress = onProgress
         self.metadataOnly = metadataOnly
+        self.privacyPolicy = privacyPolicy
+        explicitProtectedLocation = privacyPolicy.isProtected(root)
+    }
+    func skipForPrivacy(_ path: String) -> Bool {
+        guard !explicitProtectedLocation, privacyPolicy.isProtected(path) else { return false }
+        lock.lock(); privacySkipped.insert(path); lock.unlock()
+        return true
     }
     var stopped: Bool { cancellation?.isCancelled == true || Date() >= deadline || nativeFailed }
     func prepareWorkers(spare: Int) { for _ in 0..<spare { workerBudget.signal() } }
@@ -389,9 +403,10 @@ private final class NativeScanState: @unchecked Sendable {
     }
     private func emit(_ current: String) {
         lastEmission = Date()
-        let folders = tops.map { StorageFolder(path: $0.key, bytes: $0.value, limitedAccess: limitedTops.contains($0.key) ? true : nil) }.sorted { $0.bytes > $1.bytes }
+        let folders = tops.map { StorageFolder(path: $0.key, bytes: $0.value, limitedAccess: limitedTops.contains($0.key) ? true : nil, privacySkipped: privacySkipped.contains($0.key) ? true : nil) }.sorted { $0.bytes > $1.bytes }
         onProgress(StorageScanProgress(path: root, startedAt: started, completedDirectories: directories,
-            currentPath: current, folders: folders, children: [], totalBytes: nil, largeFiles: largeFiles.sorted, fileCount: regularFileCount))
+            currentPath: current, folders: folders, children: [], totalBytes: nil, largeFiles: largeFiles.sorted, fileCount: regularFileCount,
+            privacyPolicy: privacyPolicy.identifier(for: root), privacyExcluded: !privacySkipped.isEmpty, excludedPaths: privacySkipped.sorted()))
     }
     func result(rootBytes: Int64?, limited: Bool) -> NativeStorageScanner.Result {
         lock.lock(); defer { lock.unlock() }
@@ -419,18 +434,22 @@ private final class NativeScanState: @unchecked Sendable {
         let incomplete = cancelled || timedOut || rootBytes == nil
         if rootBytes != nil { directories += 1 }
         let date = Date()
-        let folders = tops.map { StorageFolder(path: $0.key, bytes: $0.value, limitedAccess: limitedTops.contains($0.key) ? true : nil) }.sorted { $0.bytes == $1.bytes ? $0.path < $1.path : $0.bytes > $1.bytes }
+        let folders = tops.map { StorageFolder(path: $0.key, bytes: $0.value, limitedAccess: limitedTops.contains($0.key) ? true : nil, privacySkipped: privacySkipped.contains($0.key) ? true : nil) }.sorted { $0.bytes == $1.bytes ? $0.path < $1.path : $0.bytes > $1.bytes }
         let measurement = StorageMeasurement(path: root, folders: folders, totalBytes: incomplete ? nil : direct + folders.reduce(0) { $0 + $1.bytes },
             date: date, limitedAccess: limited || !limitedTops.isEmpty || incomplete, timedOut: timedOut, cancelled: cancelled,
             accounting: "native-shared-v1", accountingScope: root,
-            largeFiles: metadataOnly ? nil : largeFiles.sorted, fileCount: metadataOnly ? nil : regularFileCount)
-        let children = folders.filter { !limitedTops.contains($0.path) && !incomplete }.map { folder in
-            StorageMeasurement(path: folder.path, folders: (seconds[folder.path] ?? [:]).map { StorageFolder(path: $0.key, bytes: $0.value) }.sorted { $0.bytes > $1.bytes },
+            largeFiles: metadataOnly ? nil : largeFiles.sorted, fileCount: metadataOnly ? nil : regularFileCount,
+            privacyPolicy: privacyPolicy.identifier(for: root), privacyExcluded: !privacySkipped.isEmpty, excludedPaths: privacySkipped.sorted())
+        let children = folders.filter { !limitedTops.contains($0.path) && $0.privacySkipped != true && !incomplete }.map { folder in
+            let excluded = privacySkipped.filter { $0.hasPrefix(folder.path + "/") }.sorted()
+            return StorageMeasurement(path: folder.path, folders: (seconds[folder.path] ?? [:]).map { StorageFolder(path: $0.key, bytes: $0.value, privacySkipped: privacySkipped.contains($0.key) ? true : nil) }.sorted { $0.bytes > $1.bytes },
                 totalBytes: folder.bytes, date: date, limitedAccess: measurement.limitedAccess, timedOut: false,
-                accounting: "native-shared-v1", accountingScope: root)
+                accounting: "native-shared-v1", accountingScope: root,
+                privacyPolicy: privacyPolicy.identifier(for: root), privacyExcluded: !excluded.isEmpty, excludedPaths: excluded)
         }
         onProgress(StorageScanProgress(path: root, startedAt: started, completedDirectories: directories, currentPath: root,
-            folders: folders, children: children, totalBytes: measurement.totalBytes, largeFiles: measurement.largeFiles, fileCount: measurement.fileCount))
+            folders: folders, children: children, totalBytes: measurement.totalBytes, largeFiles: measurement.largeFiles, fileCount: measurement.fileCount,
+            privacyPolicy: measurement.privacyPolicy, privacyExcluded: measurement.privacyExcluded, excludedPaths: measurement.excludedPaths))
         // Writes through a hardlink outside the watched root may not generate
         // an event under this root. Never reuse such a scan as a live cache.
         let cacheSafe = !shared.values.contains { Int($0.links) > $0.references }

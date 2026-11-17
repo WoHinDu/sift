@@ -74,6 +74,8 @@ struct CleanupDashboardView: View {
                     else if attention { Image(systemName: "exclamationmark.circle").foregroundStyle(.orange) }
                     Text(categorySizeLabel(category, missingSizes: missingSizes, measuring: measuring))
                         .font(.caption.monospacedDigit()).foregroundStyle(SiftChartStyle.secondaryText)
+                        .multilineTextAlignment(.trailing).fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: 150, alignment: .trailing)
                     Image(systemName: expanded ? "chevron.up" : "chevron.down").font(.system(size: 9, weight: .medium)).foregroundStyle(SiftChartStyle.mutedText)
                 }.padding(.horizontal, 12).padding(.vertical, 10).contentShape(Rectangle())
             }.buttonStyle(.plain)
@@ -96,6 +98,9 @@ struct CleanupDashboardView: View {
     }
 
     private func categorySizeLabel(_ category: CacheCategory, missingSizes: Bool, measuring: Bool) -> String {
+        if category == .developerTools, inventory.includesDockerEstimate {
+            return "\(ByteFormatting.string(inventory.summaryBytes(in: category))) incl. Docker estimate"
+        }
         let bytes = inventory.storedBytes(in: category)
         if bytes == 0 && measuring { return "Measuring…" }
         if bytes == 0 && missingSizes { return "Size unavailable" }
@@ -192,10 +197,10 @@ struct CleanupInventoryCard: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("CLEANUP SOURCES").font(.caption2.weight(.semibold)).tracking(0.7).foregroundStyle(SiftChartStyle.secondaryText)
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text(inventory.storedBytes == 0 && inventory.isMeasuring ? "Measuring…" : ByteFormatting.string(inventory.storedBytes))
+                        Text(inventory.summaryBytes == 0 && inventory.isMeasuring ? "Measuring…" : ByteFormatting.string(inventory.summaryBytes))
                             .font(.system(size: 23, weight: .semibold)).monospacedDigit()
-                        if inventory.storedBytes > 0 || !inventory.isMeasuring {
-                            Text("stored").font(.caption).foregroundStyle(SiftChartStyle.secondaryText)
+                        if inventory.summaryBytes > 0 || !inventory.isMeasuring {
+                            Text(inventory.includesDockerEstimate ? "incl. Docker estimate" : "stored").font(.caption).foregroundStyle(SiftChartStyle.secondaryText)
                         }
                     }
                 }
@@ -206,10 +211,10 @@ struct CleanupInventoryCard: View {
             }
             Canvas { context, size in
                 var x: CGFloat = 0
-                let visible = inventory.segments.filter { $0.bytes > 0 }
+                let visible = inventory.summarySegments.filter { $0.bytes > 0 }
                 let usable = max(0, size.width - CGFloat(max(0, visible.count - 1)) * 3)
                 for segment in visible {
-                    let width = usable * CGFloat(Double(segment.bytes) / Double(max(1, inventory.storedBytes)))
+                    let width = usable * CGFloat(Double(segment.bytes) / Double(max(1, inventory.summaryBytes)))
                     let shape = Path(roundedRect: CGRect(x: x, y: 0, width: width, height: size.height), cornerRadius: 3)
                     context.fill(shape, with: .color(SiftChartStyle.inventoryColor(for: segment.id)))
                     x += width + 3
@@ -219,7 +224,7 @@ struct CleanupInventoryCard: View {
                 }
             }.frame(height: 12).accessibilityHidden(true)
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], alignment: .leading, spacing: 6) {
-                ForEach(inventory.segments) { segment in
+                ForEach(inventory.summarySegments) { segment in
                     HStack(spacing: 5) {
                         RoundedRectangle(cornerRadius: 2).fill(SiftChartStyle.inventoryColor(for: segment.id)).frame(width: 6, height: 6)
                         Text(segment.name).foregroundStyle(SiftChartStyle.secondaryText)
@@ -228,17 +233,12 @@ struct CleanupInventoryCard: View {
                     }.font(.caption2)
                 }
             }
-            Text("Actual space freed depends on what’s removed and whether files share storage.")
+            Text(inventory.includesDockerEstimate
+                 ? "Folder sizes + Docker cleanup estimate. Actual space freed may be less; files may share storage."
+                 : "Actual space freed depends on what’s removed and whether files share storage.")
                 .font(.caption2).foregroundStyle(SiftChartStyle.mutedText)
                 .fixedSize(horizontal: false, vertical: true)
-                .help("Stored data in cleanup sources is not guaranteed freed space. Pruning may retain items still needed, and shared APFS blocks may remain after deletion. Docker’s cleanup estimate is separate.")
-            if let estimate = inventory.dockerEstimate, estimate > 0 {
-                HStack {
-                    Text("Docker cleanup estimate").foregroundStyle(SiftChartStyle.secondaryText)
-                    Spacer()
-                    Text("Up to \(ByteFormatting.string(estimate))").monospacedDigit()
-                }.font(.caption2).padding(.top, 2)
-            }
+                .help("The combined inventory includes Docker’s cleanup estimate under Developer tools, not its VM disk size. It is not measured disk usage or guaranteed freed space. Pruning may retain data, shared APFS blocks may remain, and Docker may not release host disk space immediately.")
         }.padding(13).siftStorageSurface()
     }
 }

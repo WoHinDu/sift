@@ -7,6 +7,7 @@ struct StorageFolder: Identifiable, Codable, Equatable, Sendable {
     let path: String
     let bytes: Int64
     var limitedAccess: Bool? = nil
+    var privacySkipped: Bool? = nil
     var name: String {
         if path == NSHomeDirectory() { return "Your home folder" }
         if path == StorageOverviewService.rootPath { return "Data volume" }
@@ -39,10 +40,13 @@ struct StorageMeasurement: Codable, Sendable {
     // Optional for backwards-compatible history and directory-only fallback scans.
     var largeFiles: [StorageFile]? = nil
     var fileCount: Int? = nil
+    var privacyPolicy: String? = nil
+    var privacyExcluded: Bool? = nil
+    var excludedPaths: [String]? = nil
     var isComplete: Bool { totalBytes != nil && !timedOut && cancelled != true }
     func comparable(to other: StorageMeasurement) -> Bool {
         (accounting ?? "du-allocated-v1") == (other.accounting ?? "du-allocated-v1") &&
-        accountingScope == other.accountingScope
+        accountingScope == other.accountingScope && privacyPolicy == other.privacyPolicy
     }
 
     // du reports allocated folder sizes. They are not unique APFS extents or
@@ -59,9 +63,14 @@ struct StorageOverviewService: Sendable {
     static let rootPath = "/System/Volumes/Data"
     private let runner = SecureCommandRunner()
     private let nativeScan: NativeScan
-    init(nativeScan: @escaping NativeScan = { path, cancellation, useCache, progress in
-        try NativeStorageScanner(cache: useCache ? .shared : nil).measure(path: path, cancellation: cancellation, onProgress: progress)
-    }) { self.nativeScan = nativeScan }
+    private let privacyPolicy: StoragePrivacyPolicy
+    init(privacyPolicy: StoragePrivacyPolicy = StoragePrivacyPolicy(), nativeScan: NativeScan? = nil) {
+        self.privacyPolicy = privacyPolicy
+        self.nativeScan = nativeScan ?? { path, cancellation, useCache, progress in
+            try NativeStorageScanner(cache: useCache ? .shared : nil, privacyPolicy: privacyPolicy)
+                .measure(path: path, cancellation: cancellation, onProgress: progress)
+        }
+    }
 
     static func scansOverlap(_ left: String, _ right: String) -> Bool {
         left == right || left == "/" || right == "/" || left.hasPrefix(right + "/") || right.hasPrefix(left + "/")
@@ -76,18 +85,28 @@ struct StorageOverviewService: Sendable {
             return (result.measurement, result.children)
         }
         let url = URL(fileURLWithPath: path).standardizedFileURL
-        let accumulator = StorageScanAccumulator(path: url.path)
+        let masks = privacyPolicy.fallbackMasks(for: url.path)
+        let policyID = privacyPolicy.identifier(for: url.path)
+        let publish: @Sendable (StorageScanProgress) -> Void = { progress in
+            var progress = progress
+            progress.privacyPolicy = policyID
+            progress.privacyExcluded = !masks.isEmpty
+            onProgress(progress)
+        }
+        let accumulator = StorageScanAccumulator(path: url.path, privacyPolicy: policyID, privacyExcluded: !masks.isEmpty)
         let result = runner.run(URL(fileURLWithPath: "/usr/bin/du"),
-                                arguments: ["-x", "-k", url.path], timeout: 600,
-                                captureOutput: false, onOutputLine: { accumulator.consume($0, onProgress: onProgress) }, cancellation: cancellation)
+                                arguments: ["-x", "-k"] + masks.flatMap { ["-I", $0] } + [url.path], timeout: 600,
+                                captureOutput: false, onOutputLine: { accumulator.consume($0, onProgress: publish) }, cancellation: cancellation)
         let final = accumulator.snapshot()
-        onProgress(final)
+        publish(final)
         let limited = result.exitCode != 0 || !result.error.isEmpty
         let measurement = StorageMeasurement(path: url.path, folders: final.folders, totalBytes: final.totalBytes,
-                                             date: Date(), limitedAccess: limited, timedOut: result.timedOut, cancelled: result.cancelled)
+                                             date: Date(), limitedAccess: limited, timedOut: result.timedOut, cancelled: result.cancelled,
+                                             privacyPolicy: policyID, privacyExcluded: !masks.isEmpty)
         let children = final.children.map {
             StorageMeasurement(path: $0.path, folders: $0.folders, totalBytes: $0.totalBytes,
-                               date: $0.date, limitedAccess: limited, timedOut: false)
+                               date: $0.date, limitedAccess: limited, timedOut: false,
+                               privacyPolicy: policyID, privacyExcluded: !masks.isEmpty)
         }
         return (measurement, children)
     }
@@ -303,11 +322,13 @@ typealias StorageMeasure = @Sendable (String, CommandCancellation, @escaping @Se
                 errors[path] = result.cancelled == true ? "Scan cancelled. Completed rows are retained; unmeasured rows may show earlier values." : result.timedOut ? "Refresh timed out. Completed rows are retained; try scanning a smaller folder." : "The folder could not be measured. Check its permissions."
                 let finalProgress = StorageScanProgress(path: path, startedAt: result.date, completedDirectories: 0,
                     currentPath: nil, folders: result.folders, children: [], totalBytes: nil,
-                    largeFiles: result.largeFiles, fileCount: result.fileCount)
+                    largeFiles: result.largeFiles, fileCount: result.fileCount,
+                    privacyPolicy: result.privacyPolicy, privacyExcluded: result.privacyExcluded, excludedPaths: result.excludedPaths)
                 let merged = finalProgress.displaying(over: progress[path]?.displaying(over: measurements[path]) ?? measurements[path])
                 partialMeasurements[path] = StorageMeasurement(path: path, folders: merged.folders,
                     totalBytes: nil, date: result.date, limitedAccess: true, timedOut: result.timedOut, cancelled: result.cancelled,
-                    largeFiles: merged.largeFiles, fileCount: merged.fileCount)
+                    largeFiles: merged.largeFiles, fileCount: merged.fileCount,
+                    privacyPolicy: merged.privacyPolicy, privacyExcluded: merged.privacyExcluded, excludedPaths: merged.excludedPaths)
             }
             scanningPaths.remove(path)
             scanIDs[path] = nil

@@ -20,7 +20,7 @@ struct ContentView: View {
                 ScrollViewReader { scroll in
                 ScrollView {
                     VStack(spacing: 0) {
-                        summary
+                        if section != .storage { summary }
                         if section == .storage {
                             StorageExplorerView(overview: model.storageOverview, onReviewCleanup: reviewCleanup)
                             DisclosureGroup("Free-space history") {
@@ -168,9 +168,7 @@ struct ContentView: View {
                         .foregroundStyle(SiftChartStyle.mutedText)
                 }
 
-                if section == .storage {
-                    StorageExplorerRefreshButton(overview: model.storageOverview, disabled: model.isCleaning)
-                } else {
+                if section != .storage {
                 Button {
                     switch section {
                     case .cleanup: model.scan()

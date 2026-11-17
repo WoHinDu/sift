@@ -123,20 +123,6 @@ struct StoragePathContext {
     }
 }
 
-struct StorageExplorerRefreshButton: View {
-    @ObservedObject var overview: StorageOverviewModel
-    var disabled = false
-    private var path: String { overview.location }
-    var body: some View {
-        Button { overview.scanCurrentFolder() } label: {
-            if overview.scanningPaths.contains(path) { ProgressView().controlSize(.small) }
-            else { Image(systemName: "arrow.clockwise").font(.system(size: 15)) }
-        }.buttonStyle(.plain).foregroundStyle(SiftChartStyle.secondaryText)
-            .disabled(disabled || overview.scanningPaths.contains(path) || overview.queuedPaths.contains(path))
-            .help("Scan \(path)").accessibilityLabel("Scan current folder")
-            .contextMenu { Button("Full rescan of this folder (ignore cache)") { overview.scanCurrentFolder(fullRescan: true) } }
-    }
-}
 
 struct StorageExplorerView: View {
     @ObservedObject var overview: StorageOverviewModel
@@ -145,6 +131,9 @@ struct StorageExplorerView: View {
     @State private var query = ""
     @State private var filesMode = false
     @State private var sort: StorageExplorerSort = .size
+    @State private var confirmProtectedScan = false
+    @State private var protectedScanPath: String?
+    @State private var protectedFullRescan = false
     init(overview: StorageOverviewModel, onReviewCleanup: @escaping (StorageCleanupTarget) -> Void = { _ in }, showingFiles: Bool = false) {
         self.overview = overview
         self.onReviewCleanup = onReviewCleanup
@@ -157,123 +146,197 @@ struct StorageExplorerView: View {
     }
     private var baseline: StorageMeasurement? { overview.growthBaseline(for: path) }
 
+    private var scanState: StorageBrowserStatus {
+        StorageBrowserStatus.resolve(measurement: measurement, scanning: overview.scanningPaths.contains(path),
+            queuePosition: overview.queuedPaths.firstIndex(of: path).map { $0 + 1 },
+            stopping: overview.cancellingPaths.contains(path))
+    }
+    private var folderName: String { StorageFolder(path: path, bytes: 0).name }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            explorerHeader
-            breadcrumbs
-            if path == StorageOverviewService.rootPath {
-                HStack {
-                    Button("Home folder") { overview.location = NSHomeDirectory() }
-                    Button("App data") { overview.location = NSHomeDirectory() + "/Library" }
-                }.buttonStyle(SiftQuietButtonStyle())
+            StorageCapacityOverview(values: StorageCapacityPresentation(free: app.freeDiskSpace(), capacity: app.diskCapacity()))
+            StorageLocationShortcuts(path: $overview.location)
+            VStack(alignment: .leading, spacing: 7) {
+                explorerHeader
+                if path != StorageOverviewService.rootPath { breadcrumbs }
+                scanStatus
+                if let error = overview.errors[path], measurement?.cancelled != true {
+                    Label(error, systemImage: "exclamationmark.circle")
+                        .font(.caption2).foregroundStyle(.orange).lineLimit(3).help(error)
+                }
+                if let measurement {
+                    results(measurement)
+                } else {
+                    unscannedState
+                }
             }
-            if let position = overview.queuedPaths.firstIndex(of: path) {
-                Text("Queued · \(position + 1) in line. One folder scan runs at a time.")
-                    .font(.caption).foregroundStyle(SiftChartStyle.secondaryText)
-            }
-            if let progress = overview.progress[path] { progressView(progress) }
-            if let error = overview.errors[path] { Text(error).font(.caption).foregroundStyle(.orange) }
-            if let measurement {
-                results(measurement)
-            } else if !busy {
-                StorageScanPrompt(path: path) { overview.scanCurrentFolder() }
-            }
-            Text("Read-only exploration · sizes may share APFS blocks and are not guaranteed cleanup savings.")
-                .font(.caption2).foregroundStyle(SiftChartStyle.secondaryText)
+            DisclosureGroup("About these sizes & access") {
+                VStack(alignment: .leading, spacing: 9) {
+                    Text("Read-only exploration. Sizes describe stored data, not guaranteed cleanup savings. Files and folders may share APFS blocks.")
+                    Text("Scans start only when you ask and continue when this menu closes. macOS may request access; denying it leaves partial results.")
+                    Text("Broad scans skip known privacy-protected folders, including media libraries, personal folders, cloud files, and app containers. To measure one, open it and explicitly confirm a scan; macOS may then request access.")
+                    Text("Largest files shows up to 100 regular files encountered in this location and its subfolders. File sizes overlap folder totals; filters search this sample, not the whole disk.")
+                    if let measurement { accounting(measurement) }
+                }.font(.caption2).foregroundStyle(SiftChartStyle.secondaryText).padding(.top, 7)
+            }.font(.caption).foregroundStyle(SiftChartStyle.secondaryText)
         }
-        .onChange(of: path) { _, _ in query = "" }
+        .onChange(of: path) { _, newPath in
+            query = ""; filesMode = false
+            if protectedScanPath != newPath { confirmProtectedScan = false; protectedScanPath = nil }
+        }
+        .confirmationDialog("Scan this protected location?", isPresented: $confirmProtectedScan, titleVisibility: .visible) {
+            Button("Scan this location") {
+                if let target = protectedScanPath {
+                    overview.scan(target, force: true, fullRescan: protectedFullRescan, discoverFiles: true)
+                }
+                protectedScanPath = nil
+            }
+            Button("Cancel", role: .cancel) { protectedScanPath = nil }
+        } message: {
+            Text("This folder is excluded from broad scans for privacy. Scanning it may cause macOS to ask for access. No files will be changed.")
+        }
+    }
+
+    private var unscannedState: some View {
+        VStack(spacing: 9) {
+            Image(systemName: busy ? "folder.badge.gearshape" : "folder.badge.magnifyingglass")
+                .font(.system(size: 25, weight: .light)).foregroundStyle(SiftChartStyle.secondaryText)
+            Text(busy ? "Finding what’s taking up space" : StoragePrivacyPolicy().isProtected(path) ? "Privacy-protected location" : "Explore \(folderName)")
+                .font(.callout.weight(.semibold))
+            Text(busy ? "Folders appear as they finish. You can close this menu while the scan continues."
+                      : StoragePrivacyPolicy().isProtected(path) ? "Excluded from broad scans. Scan this location only if you want to grant access when macOS asks."
+                      : "Scan to see the largest folders and files here. Nothing is scanned or deleted automatically.")
+                .font(.caption).foregroundStyle(SiftChartStyle.secondaryText)
+                .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
+        }.frame(maxWidth: .infinity).padding(.horizontal, 25).padding(.vertical, 28).siftStorageSurface()
     }
 
     private var explorerHeader: some View {
-        HStack {
-            Text("WHERE IS MY STORAGE?").font(.caption.weight(.semibold))
-            Spacer()
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(folderName).font(.system(size: 18, weight: .semibold)).lineLimit(1).truncationMode(.middle)
+            Spacer(minLength: 5)
+            if let total = measurement?.totalBytes {
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("\(measurement?.limitedAccess == true ? "≥ " : "")\(ByteFormatting.string(total))")
+                        .font(.callout.weight(.semibold)).monospacedDigit()
+                        .help("Stored data attributed to this scan, not guaranteed cleanup savings. Shared blocks may overlap other locations.")
+                    Text("in this scan").font(.caption2).foregroundStyle(SiftChartStyle.mutedText)
+                }
+            }
             if busy {
                 Button(overview.cancellingPaths.contains(path) ? "Stopping…" : "Cancel") { overview.cancel(path) }
                     .buttonStyle(SiftQuietButtonStyle()).disabled(overview.cancellingPaths.contains(path))
+            } else {
+                StorageScanButton(title: measurement == nil ? (path == StorageOverviewService.rootPath ? "Scan volume" : "Scan folder") : "Refresh", disabled: app.isCleaning) { requestScan() }
+                    .help("Scan \(path). No files are changed.")
             }
-            StorageExplorerRefreshButton(overview: overview, disabled: app.isCleaning)
+            Menu {
+                Button("Reveal in Finder") { reveal(path) }
+                Button("Copy path") { copyPath(path) }
+                Divider()
+                Button("Full rescan (ignore cache)") { requestScan(fullRescan: true) }.disabled(busy)
+            } label: { Image(systemName: "ellipsis.circle").font(.callout) }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().accessibilityLabel("Actions for current folder")
         }
     }
 
     private var breadcrumbs: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 8) {
-                Button {
-                    if let parent = StorageExplorerResults.breadcrumbs(path).dropLast().last { overview.location = parent.path }
-                } label: { Image(systemName: "chevron.left") }
-                    .buttonStyle(.plain).disabled(path == StorageOverviewService.rootPath)
-                    .keyboardShortcut("[", modifiers: .command).help("Parent folder")
-                ScrollViewReader { scroll in
+        HStack(spacing: 8) {
+            Button {
+                if let parent = StorageExplorerResults.breadcrumbs(path).dropLast().last { overview.location = parent.path }
+            } label: { Image(systemName: "chevron.left") }
+                .buttonStyle(.plain).disabled(path == StorageOverviewService.rootPath)
+                .keyboardShortcut("[", modifiers: .command).help("Parent folder")
+            ScrollViewReader { scroll in
                 ScrollView(.horizontal) {
-                HStack(spacing: 6) {
-                    ForEach(StorageExplorerResults.breadcrumbs(path)) { crumb in
-                        if crumb.path != StorageOverviewService.rootPath {
-                            Image(systemName: "chevron.right").font(.system(size: 8)).foregroundStyle(SiftChartStyle.mutedText)
+                    HStack(spacing: 5) {
+                        ForEach(StorageExplorerResults.breadcrumbs(path)) { crumb in
+                            if crumb.path != StorageOverviewService.rootPath {
+                                Image(systemName: "chevron.right").font(.system(size: 7)).foregroundStyle(SiftChartStyle.mutedText)
+                            }
+                            Button(crumb.name) { overview.location = crumb.path }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(crumb.path == path ? Color.primary : SiftChartStyle.secondaryText)
+                                .help(crumb.path).id(crumb.path)
                         }
-                        Button(crumb.name) { overview.location = crumb.path }
-                            .buttonStyle(.plain).font(.caption.weight(crumb.path == path ? .semibold : .regular))
-                            .foregroundStyle(crumb.path == path ? Color.primary : SiftChartStyle.secondaryText)
-                            .help(crumb.path).id(crumb.path)
-                    }
-                }.padding(.vertical, 2)
+                    }.padding(.vertical, 2)
                 }.scrollIndicators(.hidden)
                     .onAppear { scroll.scrollTo(path, anchor: .trailing) }
                     .onChange(of: path) { _, value in scroll.scrollTo(value, anchor: .trailing) }
+            }
+        }.font(.caption2).help(path)
+    }
+
+    private var scanStatus: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 8) {
+                if busy { ProgressView().controlSize(.mini) }
+                else {
+                    Circle().fill(scanState.needsAttention ? Color.orange : SiftChartStyle.mutedText).frame(width: 5, height: 5)
+                }
+                Text(scanState == .ready ? "Updated" : scanState.title).font(.caption2).lineLimit(1)
+                Spacer()
+                if !busy, let measurement {
+                    Text("\(measurement.date.formatted(.dateTime.day().month(.abbreviated))) · \(measurement.date.formatted(.dateTime.hour().minute()))")
+                        .font(.caption2).foregroundStyle(SiftChartStyle.mutedText)
                 }
             }
-            HStack(spacing: 6) {
-                Text(path).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
-                Spacer(minLength: 0)
-                Button { reveal(path) } label: { Image(systemName: "arrow.up.forward.square") }
-                    .buttonStyle(.plain).help("Reveal current folder in Finder").accessibilityLabel("Reveal current folder in Finder")
-            }.font(.caption2).foregroundStyle(SiftChartStyle.mutedText)
-        }
+            if let progress = overview.progress[path] { progressView(progress) }
+            else if case .queued = scanState {
+                Text("This folder will run when earlier scans finish.")
+                    .font(.caption2).foregroundStyle(SiftChartStyle.secondaryText)
+            }
+        }.foregroundStyle(SiftChartStyle.secondaryText).padding(.vertical, 3)
     }
 
     private func progressView(_ progress: StorageScanProgress) -> some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
-            VStack(alignment: .leading, spacing: 5) {
+            let elapsed = Int(max(0, context.date.timeIntervalSince(progress.startedAt)))
+            VStack(alignment: .leading, spacing: 3) {
                 HStack {
-                    Text("\(progress.completedDirectories) folders measured").monospacedDigit()
+                    Text("\(progress.completedDirectories.formatted()) folders checked")
                     Spacer()
-                    Text("\(Int(max(0, context.date.timeIntervalSince(progress.startedAt))))s elapsed").monospacedDigit()
+                    Text(elapsed < 60 ? "\(elapsed)s" : "\(elapsed / 60)m \(elapsed % 60)s")
                 }
-                if let current = progress.currentPath { Text(current).lineLimit(1).truncationMode(.middle) }
-                Text("Intermediate results · continues when you close this menu.")
+                if let current = progress.currentPath {
+                    Text(current).lineLimit(1).truncationMode(.middle).help(current)
+                }
+                if measurement != nil { Text("Updating results · earlier folder values may remain until refreshed.") }
             }.font(.caption2).foregroundStyle(SiftChartStyle.secondaryText)
         }
     }
 
     private func results(_ measurement: StorageMeasurement) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text(status(measurement)).lineLimit(2)
-                Spacer(minLength: 4)
-                if let total = measurement.totalBytes {
-                    Text("\(measurement.limitedAccess ? "≥ " : "")\(ByteFormatting.string(total))").monospacedDigit()
-                }
-            }.font(.caption2).foregroundStyle(SiftChartStyle.secondaryText)
-            if measurement.timedOut {
-                Text("Scan timed out. Results are incomplete; try a smaller folder.").font(.caption).foregroundStyle(.orange)
-            }
+        VStack(alignment: .leading, spacing: 10) {
             resultControls
             if filesMode { fileResults(measurement) } else { folderResults(measurement) }
             if !filesMode, overview.progress[path] == nil, let baseline,
                measurement.isComplete, !measurement.limitedAccess {
-                FolderGrowthView(current: measurement, previous: baseline)
+                DisclosureGroup("Folder growth") {
+                    FolderGrowthView(current: measurement, previous: baseline).padding(.top, 8)
+                }.font(.caption).foregroundStyle(SiftChartStyle.secondaryText).padding(.top, 5)
             }
-            accounting(measurement)
         }
     }
 
     private var resultControls: some View {
-        VStack(spacing: 8) {
-            HStack {
-                FullWidthSegmentedControl(labels: ["Folders", "Largest files"], selection: Binding(
-                    get: { filesMode ? 1 : 0 }, set: { filesMode = $0 == 1 }
-                ), accessibilityLabel: "Storage result type").frame(maxWidth: 230)
-                Spacer(minLength: 4)
+        VStack(spacing: 10) {
+            HStack(spacing: 18) {
+                modeTab("Folders", files: false, count: measurement?.folders.count)
+                modeTab("Largest files", files: true, count: measurement?.largeFiles?.count)
+                Spacer(minLength: 0)
+            }.overlay(alignment: .bottom) { Rectangle().fill(SiftChartStyle.rule).frame(height: 0.5).allowsHitTesting(false) }
+            HStack(spacing: 7) {
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(SiftChartStyle.mutedText)
+                    TextField(filesMode ? "Filter these files" : "Filter these folders", text: $query)
+                        .textFieldStyle(.plain).font(.caption).accessibilityLabel("Filter measured results")
+                    if !query.isEmpty {
+                        Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
+                            .buttonStyle(.plain).accessibilityLabel("Clear filter")
+                    }
+                }.padding(8).background(.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
                 Menu {
                     Picker("Sort results", selection: $sort) {
                         ForEach(StorageExplorerSort.allCases, id: \.self) { option in
@@ -282,24 +345,29 @@ struct StorageExplorerView: View {
                         }
                     }
                 } label: {
-                    HStack(spacing: 4) {
-                        Text(effectiveSort.rawValue).font(.caption2)
-                        Image(systemName: "arrow.up.arrow.down").font(.caption2)
-                    }
-                }
-                    .menuStyle(.borderlessButton).fixedSize().help("Sort: \(effectiveSort.rawValue)")
+                    HStack(spacing: 3) {
+                        Text(effectiveSort == .size ? "Size" : effectiveSort == .growth ? "Growth" : "Name")
+                        Image(systemName: "arrow.up.arrow.down")
+                    }.font(.caption2)
+                }.menuStyle(.borderlessButton).fixedSize().help("Sort: \(effectiveSort.rawValue)")
                     .accessibilityLabel("Sort results: \(effectiveSort.rawValue)")
             }
-            HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass").foregroundStyle(SiftChartStyle.mutedText)
-                TextField(filesMode ? "Filter discovered files by name or path" : "Filter measured folders by name or path", text: $query)
-                    .textFieldStyle(.plain).font(.caption).accessibilityLabel("Filter measured results")
-                if !query.isEmpty {
-                    Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
-                        .buttonStyle(.plain).accessibilityLabel("Clear filter")
-                }
-            }.padding(8).siftStorageSurface()
         }
+    }
+
+    private func modeTab(_ title: String, files: Bool, count: Int?) -> some View {
+        let selected = filesMode == files
+        return Button { filesMode = files } label: {
+            HStack(spacing: 5) {
+                Text(title).font(.caption.weight(selected ? .semibold : .regular))
+                if let count { Text(count.formatted()).font(.caption2.monospacedDigit()).foregroundStyle(SiftChartStyle.mutedText) }
+            }
+            .foregroundStyle(selected ? Color.primary : SiftChartStyle.secondaryText)
+            .padding(.vertical, 8)
+            .overlay(alignment: .bottom) {
+                Capsule().fill(selected ? SiftChartStyle.accent : .clear).frame(height: 2).allowsHitTesting(false)
+            }.contentShape(Rectangle())
+        }.buttonStyle(.plain).accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     private var effectiveSort: StorageExplorerSort {
@@ -308,17 +376,20 @@ struct StorageExplorerView: View {
 
     private func folderResults(_ measurement: StorageMeasurement) -> some View {
         let rows = StorageExplorerResults.folders(measurement, query: query, sort: effectiveSort, baseline: baseline)
-        let maximum = measurement.folders.map(\.bytes).max() ?? 0
         return VStack(alignment: .leading, spacing: 8) {
-            Text("\(rows.count) of \(measurement.folders.count) folders · bars relative to largest folder")
-                .font(.caption2).foregroundStyle(SiftChartStyle.mutedText)
+            if !query.isEmpty {
+                Text("\(rows.count) matching folders").font(.caption2).foregroundStyle(SiftChartStyle.mutedText)
+            }
             if rows.isEmpty {
-                emptyResults(query.isEmpty ? "No readable subfolders found. Check Largest files for files stored here." : "No measured folders match this filter.")
+                emptyResults(!query.isEmpty ? "No measured folders match this filter." : busy ? "Measuring subfolders… completed results will appear here." : "No readable subfolders found. Check Largest files for files stored here.")
+                if query.isEmpty, (measurement.fileCount ?? 0) > 0 {
+                    Button("View largest files") { filesMode = true }.buttonStyle(SiftQuietButtonStyle())
+                }
             } else {
                 LazyVStack(spacing: 0) {
                     ForEach(rows) { folder in
-                        explorerRow(path: folder.path, name: folder.name, bytes: folder.bytes, maximum: maximum,
-                            limited: folder.limitedAccess == true, isFile: false,
+                        explorerRow(path: folder.path, name: folder.name, bytes: folder.bytes,
+                            limited: folder.limitedAccess == true, privacySkipped: folder.privacySkipped == true, isFile: false,
                             detail: growthDetail(folder, measurement: measurement), shared: false)
                         if folder.id != rows.last?.id { Divider().padding(.horizontal, 12) }
                     }
@@ -329,23 +400,20 @@ struct StorageExplorerView: View {
 
     private func fileResults(_ measurement: StorageMeasurement) -> some View {
         let rows = StorageExplorerResults.files(measurement, query: query, sort: effectiveSort)
-        let maximum = measurement.largeFiles?.map(\.bytes).max() ?? 0
         return VStack(alignment: .leading, spacing: 8) {
             if measurement.largeFiles == nil {
-                emptyResults("This scan contains folders only. Scan this folder to discover files; discovery needs supported native APFS metadata and is unavailable in the directory-only fallback.")
-                if !busy { Button("Scan this folder for files") { overview.scanCurrentFolder() }.buttonStyle(SiftQuietButtonStyle()) }
+                emptyResults(busy ? "Looking for large files… results will appear as the scan progresses." : "This scan has folder sizes only. Refresh this location to look for large files. File lists require a native APFS scan.")
             } else {
-                Text("Largest \(measurement.largeFiles?.count ?? 0) of \(measurement.fileCount ?? 0) files encountered · includes subfolders\(query.isEmpty ? "" : " · \(rows.count) matches")")
+                Text("\(measurement.largeFiles?.count ?? 0) largest of \((measurement.fileCount ?? 0).formatted()) files checked\(query.isEmpty ? "" : " · \(rows.count) matches")")
                     .font(.caption2).foregroundStyle(SiftChartStyle.secondaryText)
-                Text("File allocations may overlap each other and folder totals. Shared files are not exclusive savings; bars compare file sizes.")
-                    .font(.caption2).foregroundStyle(SiftChartStyle.mutedText)
+                    .help("Includes subfolders. Filters search only this largest-file sample; file sizes overlap folder totals and are not exclusive savings.")
                 if rows.isEmpty {
-                    emptyResults(query.isEmpty ? "No regular files found in the readable part of this scan." : "No files in the largest-\(StorageExplorerResults.fileLimit) sample match. Scan a narrower folder to discover more.")
+                    emptyResults(!query.isEmpty ? "No files in the largest-\(StorageExplorerResults.fileLimit) sample match. Scan a narrower folder to discover more." : busy ? "Looking for large files… results will appear as the scan progresses." : "No regular files found in the readable part of this scan.")
                 } else {
                     LazyVStack(spacing: 0) {
                         ForEach(rows) { file in
-                            explorerRow(path: file.path, name: file.name, bytes: file.bytes, maximum: maximum,
-                                limited: false, isFile: true,
+                            explorerRow(path: file.path, name: file.name, bytes: file.bytes,
+                                limited: false, privacySkipped: false, isFile: true,
                                 detail: "\(file.shared ? "Shared · " : "")\(ByteFormatting.string(file.logicalBytes)) logical · \(relative(file.path))", shared: file.shared)
                             if file.id != rows.last?.id { Divider().padding(.horizontal, 12) }
                         }
@@ -355,53 +423,47 @@ struct StorageExplorerView: View {
         }
     }
 
-    private func explorerRow(path rowPath: String, name: String, bytes: Int64, maximum: Int64,
-                             limited: Bool, isFile: Bool, detail: String?, shared: Bool) -> some View {
+    private func explorerRow(path rowPath: String, name: String, bytes: Int64,
+                             limited: Bool, privacySkipped: Bool, isFile: Bool, detail: String?, shared: Bool) -> some View {
         let context = StoragePathContext.classify(rowPath, caches: app.globalCaches, workspaces: app.workspaces)
-        return VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Button {
-                    if isFile { reveal(rowPath) } else { overview.location = rowPath }
-                } label: {
-                    HStack(spacing: 8) {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(name).font(.callout.weight(.medium)).lineLimit(1).truncationMode(.middle)
-                            if let detail { Text(detail).font(.caption2).foregroundStyle(SiftChartStyle.secondaryText).lineLimit(1).truncationMode(.middle) }
+        return HStack(spacing: 8) {
+            Button {
+                if isFile { reveal(rowPath) } else { overview.location = rowPath }
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: privacySkipped ? "lock" : isFile ? "doc" : "folder")
+                        .font(.system(size: 14)).foregroundStyle(context.color)
+                        .frame(width: 28, height: 30)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(name).font(.callout.weight(.medium)).lineLimit(1).truncationMode(.middle)
+                        if let subtitle = privacySkipped ? "Privacy protected" : detail ?? (context.target != nil || context.label == "Personal data" ? context.label : nil) {
+                            Text(subtitle).font(.caption2).foregroundStyle(SiftChartStyle.mutedText).lineLimit(1).truncationMode(.middle)
                         }
-                        Spacer(minLength: 2)
-                        Text(limited ? (bytes > 0 ? "≥ \(ByteFormatting.string(bytes))" : "Unavailable") : ByteFormatting.string(bytes))
-                            .font(.caption.monospacedDigit())
-                        Image(systemName: isFile ? "arrow.up.forward.square" : "chevron.right")
-                            .font(.caption2).foregroundStyle(SiftChartStyle.mutedText)
-                    }.contentShape(Rectangle())
-                }.buttonStyle(.plain).help(isFile ? "Reveal in Finder · does not open or delete the file" : "Explore folder")
-                Menu {
-                    Button("Reveal in Finder") { reveal(rowPath) }
-                    Button("Copy path") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(rowPath, forType: .string) }
-                    if !isFile { Button("Scan this folder") { overview.location = rowPath; overview.scanCurrentFolder() } }
-                    if let target = context.target { Button("Review \(target.name) cleanup…") { onReviewCleanup(target) } }
-                } label: { Image(systemName: "ellipsis") }
-                    .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("Actions for \(name)")
-            }
-            GeometryReader { geometry in
-                ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 2).fill(.primary.opacity(0.05))
-                    RoundedRectangle(cornerRadius: 2).fill(context.color.opacity(shared || limited ? 0.5 : 0.8))
-                        .frame(width: geometry.size.width * StorageExplorerResults.fraction(bytes: bytes, maximum: maximum))
-                }
-            }.frame(height: 4).accessibilityHidden(true).allowsHitTesting(false)
-            HStack(spacing: 5) {
-                Circle().fill(context.color).frame(width: 4, height: 4)
-                Text(context.label)
-                if limited { Text("· limited access") }
-                Spacer()
+                    }
+                    Spacer(minLength: 3)
+                    VStack(alignment: .trailing, spacing: 3) {
+                        Text(privacySkipped ? "Skipped" : limited ? (bytes > 0 ? "≥ \(ByteFormatting.string(bytes))" : "Unavailable") : ByteFormatting.string(bytes))
+                            .font(.caption.weight(.medium).monospacedDigit())
+                        if shared || limited {
+                            Text(limited ? "Limited access" : "Shared").font(.caption2).foregroundStyle(SiftChartStyle.mutedText)
+                        }
+                    }
+                    Image(systemName: isFile ? "arrow.up.forward.square" : "chevron.right")
+                        .font(.system(size: 9)).foregroundStyle(SiftChartStyle.mutedText)
+                }.contentShape(Rectangle())
+            }.buttonStyle(.plain).help(isFile ? "Reveal in Finder · never opens or deletes this file" : "Explore folder")
+            Menu {
+                Button("Reveal in Finder") { reveal(rowPath) }
+                Button("Copy path") { copyPath(rowPath) }
+                if !isFile { Button("Scan this folder…") { overview.location = rowPath; requestScan() } }
                 if let target = context.target {
-                    Button("Review cleanup…") { onReviewCleanup(target) }
-                        .buttonStyle(.plain).foregroundStyle(SiftChartStyle.accent)
-                        .help("\(target.scopeDescription) \(target.path). Nothing is selected or deleted automatically.")
+                    Divider()
+                    Button("Review \(target.name) cleanup…") { onReviewCleanup(target) }
+                        .help(target.scopeDescription)
                 }
-            }.font(.caption2).foregroundStyle(SiftChartStyle.mutedText)
-        }.padding(12)
+            } label: { Image(systemName: "ellipsis") }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().accessibilityLabel("Actions for \(name)")
+        }.padding(.horizontal, 10).padding(.vertical, 10)
     }
 
     private func emptyResults(_ text: String) -> some View {
@@ -417,14 +479,15 @@ struct StorageExplorerView: View {
         return "\(delta > 0 ? "+" : "−")\(ByteFormatting.string(abs(delta))) since \(baseline.date.formatted(date: .abbreviated, time: .omitted))"
     }
 
-    private func status(_ measurement: StorageMeasurement) -> String {
-        let state = overview.progress[path] != nil ? "Live · earlier folder rows retained" :
-            measurement.cancelled == true ? "Cancelled · incomplete" : measurement.limitedAccess ? "Limited access · partial results" :
-            measurement.cached == true ? "Validated cached measurement" : "Readable folders measured"
-        return "\(state) · \(measurement.date.formatted(.dateTime.day().month(.abbreviated).hour().minute()))"
-    }
+
 
     @ViewBuilder private func accounting(_ measurement: StorageMeasurement) -> some View {
+        if measurement.privacyExcluded == true {
+            Text("Protected folders were excluded, not measured as empty. Their storage is missing from this scan’s total.")
+            if let paths = measurement.excludedPaths, !paths.isEmpty {
+                ForEach(paths, id: \.self) { Text($0).textSelection(.enabled) }
+            }
+        }
         if let total = measurement.totalBytes {
             let directFiles = max(0, total - measurement.folders.reduce(0) { $0 + $1.bytes })
             if directFiles > 0 {
@@ -455,4 +518,18 @@ struct StorageExplorerView: View {
         return file.hasPrefix(prefix) ? String(file.dropFirst(prefix.count)) : file
     }
     private func reveal(_ path: String) { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) }
+    private func requestScan(fullRescan: Bool = false) {
+        guard !busy else { return }
+        if StoragePrivacyPolicy().isProtected(path) {
+            protectedScanPath = path
+            protectedFullRescan = fullRescan
+            confirmProtectedScan = true
+        } else {
+            overview.scanCurrentFolder(fullRescan: fullRescan)
+        }
+    }
+    private func copyPath(_ path: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(path, forType: .string)
+    }
 }

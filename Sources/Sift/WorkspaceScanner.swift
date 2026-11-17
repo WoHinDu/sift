@@ -1,6 +1,7 @@
 import Foundation
 
 struct WorkspaceScanner: Sendable {
+    var privacyPolicy = StoragePrivacyPolicy()
     private var fileManager: FileManager { FileManager.default }
 
     func scan(roots: [URL]) -> [Workspace] {
@@ -46,6 +47,10 @@ struct WorkspaceScanner: Sendable {
             ) else { continue }
 
             while let item = enumerator.nextObject() as? URL {
+                if privacyPolicy.shouldSkip(item.path, scanRoot: root.path) {
+                    enumerator.skipDescendants()
+                    continue
+                }
                 let values = try? item.resourceValues(forKeys: Set(keys))
                 guard values?.isDirectory == true else { continue }
 
@@ -83,6 +88,7 @@ struct WorkspaceScanner: Sendable {
                   ) else { continue }
 
             for child in children {
+                if privacyPolicy.shouldSkip(child.path, scanRoot: root.path) { continue }
                 let values = try? child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
                 guard values?.isDirectory == true, values?.isSymbolicLink != true else { continue }
                 if isGitWorkspace(child) { found.insert(child.standardizedFileURL) }

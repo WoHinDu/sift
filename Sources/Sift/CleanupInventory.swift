@@ -58,6 +58,18 @@ struct CleanupInventory {
         if case let .available(bytes, _) = docker { return bytes }
         return nil
     }
+    // A presentation-only combined inventory, not measured disk usage or savings.
+    func summaryBytes(in category: CacheCategory) -> Int64 {
+        storedBytes(in: category) + (category == .developerTools ? max(0, dockerEstimate ?? 0) : 0)
+    }
+    var summarySegments: [Segment] {
+        segments.map { segment in
+            Segment(id: segment.id, name: segment.name,
+                    bytes: segment.bytes + (segment.id == CacheCategory.developerTools.id ? max(0, dockerEstimate ?? 0) : 0))
+        }
+    }
+    var summaryBytes: Int64 { summarySegments.reduce(0) { $0 + $1.bytes } }
+    var includesDockerEstimate: Bool { (dockerEstimate ?? 0) > 0 }
 }
 
 struct CleanupObservation {

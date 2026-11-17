@@ -68,6 +68,22 @@ final class CleanupDashboardTests: XCTestCase {
         XCTAssertEqual(cache("uv", bytes: 0).measuredBytes, 0)
     }
 
+    func testCombinedSummaryIncludesDockerOnceWithoutChangingStoredMeasurements() {
+        let inventory = CleanupInventory(worktreeBytes: 10, caches: [cache("uv", bytes: 20), cache("pulumi", bytes: 30)],
+                                         docker: .available(reclaimableBytes: 90, detail: "Estimate"))
+        XCTAssertEqual(inventory.storedBytes, 60)
+        XCTAssertEqual(inventory.summaryBytes, 150)
+        XCTAssertEqual(inventory.summaryBytes(in: .developerTools), 120)
+        XCTAssertEqual(inventory.summaryBytes(in: .packages), 20)
+        XCTAssertEqual(inventory.summarySegments.map(\.bytes), [10, 20, 0, 120])
+        XCTAssertTrue(inventory.includesDockerEstimate)
+        for state: DockerState in [.checking, .unavailable("Offline"), .available(reclaimableBytes: 0, detail: "Empty")] {
+            let unavailable = CleanupInventory(worktreeBytes: 10, caches: [], docker: state)
+            XCTAssertEqual(unavailable.summaryBytes, unavailable.storedBytes)
+            XCTAssertFalse(unavailable.includesDockerEstimate)
+        }
+    }
+
     @MainActor func testCleanupScreenRendersWithGroupedInventory() throws {
         let model = AppModel()
         let fixtureRoot = URL(fileURLWithPath: "/fixture/project")

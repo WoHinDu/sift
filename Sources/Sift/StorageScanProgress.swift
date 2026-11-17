@@ -11,18 +11,27 @@ struct StorageScanProgress: Sendable {
     var activeFolder: StorageFolder? = nil
     var largeFiles: [StorageFile]? = nil
     var fileCount: Int? = nil
+    var privacyPolicy: String? = nil
+    var privacyExcluded: Bool? = nil
+    var excludedPaths: [String]? = nil
 
     /// Keep old rows visible until their replacement arrives. An in-flight
     /// measurement never has a total: residuals must not imply completed work.
     func displaying(over previous: StorageMeasurement?) -> StorageMeasurement {
-        var rows = Dictionary((previous?.folders ?? []).map { ($0.path, $0) }, uniquingKeysWith: { _, new in new })
+        // Older unrestricted results are a different measurement scope. Do not
+        // reintroduce their protected paths while a privacy-safe scan streams.
+        let retained = privacyPolicy != nil && privacyPolicy != previous?.privacyPolicy ? nil : previous
+        var rows = Dictionary((retained?.folders ?? []).map { ($0.path, $0) }, uniquingKeysWith: { _, new in new })
         for folder in folders { rows[folder.path] = folder }
-        let oldOrder = previous?.folders.map(\.path) ?? []
+        let oldOrder = retained?.folders.map(\.path) ?? []
         let ordered = oldOrder.compactMap { rows.removeValue(forKey: $0) } + rows.values.sorted { $0.bytes > $1.bytes }
         return StorageMeasurement(path: path, folders: ordered,
-                                  totalBytes: nil, date: previous?.date ?? startedAt,
-                                  limitedAccess: previous?.limitedAccess ?? false, timedOut: false,
-                                  largeFiles: largeFiles ?? previous?.largeFiles, fileCount: fileCount ?? previous?.fileCount)
+                                  totalBytes: nil, date: retained?.date ?? startedAt,
+                                  limitedAccess: retained?.limitedAccess ?? false, timedOut: false,
+                                  largeFiles: largeFiles ?? retained?.largeFiles, fileCount: fileCount ?? retained?.fileCount,
+                                  privacyPolicy: privacyPolicy ?? retained?.privacyPolicy,
+                                  privacyExcluded: privacyExcluded ?? retained?.privacyExcluded,
+                                  excludedPaths: excludedPaths ?? retained?.excludedPaths)
     }
 }
 
@@ -39,8 +48,14 @@ final class StorageScanAccumulator: @unchecked Sendable {
     private var grandchildren: [String: [String: Int64]] = [:]
     private var lastEmission = Date.distantPast
     private var active: StorageFolder?
+    private let privacyPolicy: String?
+    private let privacyExcluded: Bool?
 
-    init(path: String) { root = path }
+    init(path: String, privacyPolicy: String? = nil, privacyExcluded: Bool? = nil) {
+        root = path
+        self.privacyPolicy = privacyPolicy
+        self.privacyExcluded = privacyExcluded
+    }
 
     func consume(_ line: String, onProgress: @Sendable (StorageScanProgress) -> Void) {
         guard let entry = Self.entry(line), entry.path == root || entry.path.hasPrefix(root == "/" ? "/" : root + "/") else { return }
@@ -78,11 +93,12 @@ final class StorageScanAccumulator: @unchecked Sendable {
         let measured = folders.map { folder in
             StorageMeasurement(path: folder.path,
                                folders: (grandchildren[folder.path] ?? [:]).map { StorageFolder(path: $0.key, bytes: $0.value) }.sorted { $0.bytes > $1.bytes },
-                               totalBytes: folder.bytes, date: Date(), limitedAccess: true, timedOut: false)
+                               totalBytes: folder.bytes, date: Date(), limitedAccess: true, timedOut: false,
+                               privacyPolicy: privacyPolicy, privacyExcluded: privacyExcluded)
         }
         return StorageScanProgress(path: root, startedAt: startedAt, completedDirectories: count,
                                    currentPath: current, folders: folders, children: measured, totalBytes: total,
-                                   activeFolder: active)
+                                   activeFolder: active, privacyPolicy: privacyPolicy, privacyExcluded: privacyExcluded)
     }
 
     static func entry(_ line: String) -> StorageFolder? {
