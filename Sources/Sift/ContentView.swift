@@ -2,7 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     var applicationIcon: NSImage? = nil
-    private enum Section: String, CaseIterable { case cleanup = "Clean up", storage = "Storage", memory = "Memory" }
+    private enum Section: String, CaseIterable { case cleanup = "Clean up", memory = "Memory" }
     @EnvironmentObject private var model: AppModel
     @Environment(\.colorScheme) private var colorScheme
     @State private var confirmation: CleanupConfirmation?
@@ -20,13 +20,8 @@ struct ContentView: View {
                 ScrollViewReader { scroll in
                 ScrollView {
                     VStack(spacing: 0) {
-                        if section != .storage { summary }
-                        if section == .storage {
-                            StorageExplorerView(overview: model.storageOverview, onReviewCleanup: reviewCleanup)
-                            DisclosureGroup("Free-space history") {
-                                DiskSpaceHistoryView(samples: model.diskHistory.samples).padding(.top, 8)
-                            }.font(.caption).padding(.top, 20)
-                        } else if section == .memory {
+                        summary
+                        if section == .memory {
                             MemoryOverviewView(memory: model.memoryOverview)
                         } else {
                             if let target = cleanupReviewTarget {
@@ -168,11 +163,9 @@ struct ContentView: View {
                         .foregroundStyle(SiftChartStyle.mutedText)
                 }
 
-                if section != .storage {
                 Button {
                     switch section {
                     case .cleanup: model.scan()
-                    case .storage: break // The scoped Storage button observes its own model.
                     case .memory: model.memoryOverview.refresh()
                     }
                 } label: {
@@ -183,9 +176,8 @@ struct ContentView: View {
                     }
                 }
                 .buttonStyle(.plain).foregroundStyle(SiftChartStyle.secondaryText)
-                .disabled(model.isCleaning || (section == .cleanup && model.isScanning) || (section == .memory && model.memoryOverview.refreshing))
+                .disabled((section == .cleanup && (model.isCleaning || model.isScanning)) || (section == .memory && model.memoryOverview.refreshing))
                 .help("Scan again")
-                }
             }
         }
         .padding(.horizontal, 18).padding(.top, 12).padding(.bottom, 12)
@@ -232,13 +224,15 @@ struct ContentView: View {
             inventory: CleanupInventory(worktreeBytes: model.workspaces.reduce(0) { $0 + $1.reclaimableBytes },
                                         caches: model.globalCaches, docker: model.dockerState, worktreesUnmeasured: isInitialScan),
             observation: model.lastCleanupObservation,
-            cleaningID: model.cleaningGlobalCacheID, cleaningDocker: model.isCleaningDocker,
-            isCleaning: model.isCleaning, eligibleCount: model.cleanableGlobalStorageCount,
+            cleaningIDs: model.cleaningGlobalCacheIDs, cleaningDocker: model.isCleaningDocker,
+            eligibleCount: model.cleanableGlobalStorageCount,
             onClean: { confirmation = .global($0) },
             onDocker: { confirmation = .docker },
             onCleanEligible: { confirmation = .allGlobals },
             onStopUV: { confirmation = .stopUVProcesses($0) },
-            reviewCacheID: reviewedCacheID
+            reviewCacheID: reviewedCacheID,
+            blockedCacheIDs: Set(model.globalCaches.filter { !model.canCleanCache($0) }.map(\.id)),
+            cleanupErrors: model.cleanupErrors
         )
     }
 
@@ -463,6 +457,20 @@ struct ContentView: View {
 
                         Divider()
 
+                        VStack(alignment: .leading, spacing: 9) {
+                            Text("MAC STORAGE").font(.caption.weight(.semibold)).foregroundStyle(SiftChartStyle.secondaryText)
+                            Button {
+                                if MacStorageSettings.open() { showSettings = false }
+                            } label: {
+                                Label("Open macOS Storage Settings…", systemImage: "externaldrive")
+                            }
+                            .buttonStyle(SiftQuietButtonStyle())
+                            Text("See your Mac’s storage breakdown and Apple’s storage recommendations.")
+                                .font(.caption2).foregroundStyle(SiftChartStyle.mutedText)
+                        }
+
+                        Divider()
+
                         VStack(alignment: .leading, spacing: 10) {
                             Text("WORKTREE CLEANUP").font(.caption.weight(.semibold)).foregroundStyle(SiftChartStyle.secondaryText)
                             HStack(alignment: .center, spacing: 12) {
@@ -621,14 +629,14 @@ struct ContentView: View {
                 .font(.caption.weight(.medium)).foregroundStyle(SiftChartStyle.secondaryText)
                 Spacer()
                 if section == .cleanup {
-                    if model.isCleaning {
+                    if model.isCleaningWorktrees {
                         ProgressView().controlSize(.small).accessibilityLabel("Cleanup in progress")
                     } else if model.selectedCandidates.isEmpty {
-                        Text(isInitialScan ? "Scanning worktrees…" : "No folders selected")
+                        Text(model.isCleaning ? "\(model.cleanupActivity.jobs.count) cleanup\(model.cleanupActivity.jobs.count == 1 ? "" : "s") running" : isInitialScan ? "Scanning worktrees…" : "No folders selected")
                             .font(.caption).foregroundStyle(SiftChartStyle.mutedText)
                     } else {
                         CleanupSelectionButton(bytes: model.selectedBytes, deletesImmediately: model.deletesImmediately,
-                                               disabled: isInitialScan) { confirmation = .folders }
+                                               disabled: isInitialScan || !model.canCleanSelected) { confirmation = .folders }
                     }
                 }
             }
@@ -700,7 +708,7 @@ private enum CleanupConfirmation: Equatable {
         case .docker:
             return "Pruning is permanent and uses only the local Docker Engine. Unused images and build cache are removed; active images, containers, and volumes remain untouched."
         case .allGlobals:
-            let names = model.cleanableGlobalCaches.map(\.name) + (model.dockerState.reclaimableBytes > 0 ? ["Docker unused data"] : [])
+            let names = model.cleanableGlobalCaches.map(\.name) + (model.dockerState.reclaimableBytes > 0 && !model.isCleaningDocker ? ["Docker unused data"] : [])
             return "Eligible sources: \(names.joined(separator: ", ")). Cleanup is permanent. Plugins, simulators, and blocked caches are excluded. Docker containers and volumes, app profiles, and conversations remain protected. Stored sizes are not guaranteed savings."
         case let .global(id):
             if let cache = model.globalCaches.first(where: { $0.id == id }), id == "simulators" || id == "pulumi" || RegenerableCacheService.definitions.contains(where: { $0.id == id }) {

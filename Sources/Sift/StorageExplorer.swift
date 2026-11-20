@@ -134,10 +134,12 @@ struct StorageExplorerView: View {
     @State private var confirmProtectedScan = false
     @State private var protectedScanPath: String?
     @State private var protectedFullRescan = false
-    init(overview: StorageOverviewModel, onReviewCleanup: @escaping (StorageCleanupTarget) -> Void = { _ in }, showingFiles: Bool = false) {
+    var showsCapacity = true
+    init(overview: StorageOverviewModel, onReviewCleanup: @escaping (StorageCleanupTarget) -> Void = { _ in }, showingFiles: Bool = false, showsCapacity: Bool = true) {
         self.overview = overview
         self.onReviewCleanup = onReviewCleanup
         _filesMode = State(initialValue: showingFiles)
+        self.showsCapacity = showsCapacity
     }
     private var path: String { overview.location }
     private var busy: Bool { overview.scanningPaths.contains(path) || overview.queuedPaths.contains(path) }
@@ -155,7 +157,9 @@ struct StorageExplorerView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            StorageCapacityOverview(values: StorageCapacityPresentation(free: app.freeDiskSpace(), capacity: app.diskCapacity()))
+            if showsCapacity {
+                StorageCapacityOverview(values: StorageCapacityPresentation(free: app.freeDiskSpace(), capacity: app.diskCapacity()))
+            }
             StorageLocationShortcuts(path: $overview.location)
             VStack(alignment: .leading, spacing: 7) {
                 explorerHeader
@@ -228,7 +232,7 @@ struct StorageExplorerView: View {
                 Button(overview.cancellingPaths.contains(path) ? "Stopping…" : "Cancel") { overview.cancel(path) }
                     .buttonStyle(SiftQuietButtonStyle()).disabled(overview.cancellingPaths.contains(path))
             } else {
-                StorageScanButton(title: measurement == nil ? (path == StorageOverviewService.rootPath ? "Scan volume" : "Scan folder") : "Refresh", disabled: app.isCleaning) { requestScan() }
+                StorageScanButton(title: measurement == nil ? (path == StorageOverviewService.rootPath ? "Scan volume" : "Scan folder") : "Scan again", disabled: app.isCleaning) { requestScan() }
                     .help("Scan \(path). No files are changed.")
             }
             Menu {
@@ -275,7 +279,7 @@ struct StorageExplorerView: View {
                 else {
                     Circle().fill(scanState.needsAttention ? Color.orange : SiftChartStyle.mutedText).frame(width: 5, height: 5)
                 }
-                Text(scanState == .ready ? "Updated" : scanState.title).font(.caption2).lineLimit(1)
+                Text(busy || measurement == nil ? scanState.title : "\(scanState == .ready ? "Saved scan" : scanState.title) · not live").font(.caption2).lineLimit(2)
                 Spacer()
                 if !busy, let measurement {
                     Text("\(measurement.date.formatted(.dateTime.day().month(.abbreviated))) · \(measurement.date.formatted(.dateTime.hour().minute()))")

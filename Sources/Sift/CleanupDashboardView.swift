@@ -3,15 +3,16 @@ import SwiftUI
 struct CleanupDashboardView: View {
     let inventory: CleanupInventory
     let observation: CleanupObservation?
-    let cleaningID: String?
+    let cleaningIDs: Set<String>
     let cleaningDocker: Bool
-    let isCleaning: Bool
     let eligibleCount: Int
     let onClean: (String) -> Void
     let onDocker: () -> Void
     let onCleanEligible: () -> Void
     let onStopUV: (Int) -> Void
     var reviewCacheID: String? = nil
+    var blockedCacheIDs: Set<String> = []
+    var cleanupErrors: [String: String] = [:]
     @State var expandedCategories: Set<CacheCategory> = []
     @State var expandedRows = Set<String>()
 
@@ -24,7 +25,7 @@ struct CleanupDashboardView: View {
                 Spacer()
                 Button("Clean eligible…") { onCleanEligible() }
                     .font(.caption.weight(.medium)).buttonStyle(.plain).foregroundStyle(SiftChartStyle.accent)
-                    .disabled(eligibleCount == 0 || isCleaning)
+                    .disabled(eligibleCount == 0)
                     .help("Review \(eligibleCount) eligible cleanup sources. Plugins, simulators, and blocked caches are excluded.")
             }
             VStack(spacing: 0) {
@@ -54,8 +55,12 @@ struct CleanupDashboardView: View {
         let caches = inventory.caches(in: category)
         let expanded = expandedCategories.contains(category)
         let measuring = caches.contains { $0.state == .checking } || (category == .developerTools && inventory.docker == .checking)
-        let busy = caches.contains { $0.id == cleaningID } || (category == .developerTools && cleaningDocker)
-        let attention = caches.contains { if case .failed = $0.state { return true }; return false }
+        let busy = caches.contains { cleaningIDs.contains($0.id) } || (category == .developerTools && cleaningDocker)
+        let attention = caches.contains { cache in
+            if cleanupErrors["cache:" + cache.id] != nil { return true }
+            if case .failed = cache.state { return true }
+            return false
+        } || (category == .developerTools && cleanupErrors["docker"] != nil)
         let count = caches.count + (category == .developerTools ? 1 : 0)
         let missingSizes = caches.contains { switch $0.state { case .checking, .failed, .unavailable: true; default: false } }
         return VStack(spacing: 0) {
@@ -126,13 +131,13 @@ struct CleanupDashboardView: View {
                 }.buttonStyle(.plain).help("Show cleanup details and cache location")
                     .accessibilityValue(expanded ? "Expanded" : "Collapsed")
                 Spacer(minLength: 4)
-                if cleaningID == cache.id || cache.state == .checking {
+                if cleaningIDs.contains(cache.id) || cache.state == .checking {
                     ProgressView().controlSize(.small).accessibilityLabel("Measuring or cleaning \(cache.name)")
                 } else {
                     switch cache.state {
                     case let .blocked(bytes, _, count):
                         Text("\(ByteFormatting.string(bytes)) stored").font(.caption.monospacedDigit()).foregroundStyle(SiftChartStyle.secondaryText)
-                        Button("Stop uv…") { onStopUV(count) }.buttonStyle(SiftQuietButtonStyle()).disabled(isCleaning)
+                        Button("Stop uv…") { onStopUV(count) }.buttonStyle(SiftQuietButtonStyle()).disabled(blockedCacheIDs.contains(cache.id))
                     case let .failed(message):
                         Image(systemName: "exclamationmark.circle").foregroundStyle(.orange).help(message).accessibilityLabel(message)
                         Text("Failed").font(.caption2).foregroundStyle(SiftChartStyle.secondaryText)
@@ -142,12 +147,15 @@ struct CleanupDashboardView: View {
                         if bytes > 0 {
                             Text("\(ByteFormatting.string(bytes)) stored").font(.caption.monospacedDigit()).foregroundStyle(SiftChartStyle.secondaryText)
                             Button(cache.onlyPrunesUnusedData ? "Prune…" : "Clean…") { onClean(cache.id) }
-                                .buttonStyle(SiftQuietButtonStyle()).disabled(isCleaning)
+                                .buttonStyle(SiftQuietButtonStyle()).disabled(blockedCacheIDs.contains(cache.id))
                         } else { Text("Empty").font(.caption2).foregroundStyle(SiftChartStyle.mutedText) }
                     case .checking: EmptyView()
                     }
                 }
             }.padding(.horizontal, 12).padding(.vertical, 11)
+            if let error = cleanupErrors["cache:" + cache.id] {
+                Text(error).font(.caption2).foregroundStyle(.orange).padding(.horizontal, 12).padding(.bottom, 8)
+            }
             if case let .blocked(_, _, count) = cache.state {
                 Text("\(count) running uv command\(count == 1 ? " holds" : "s hold") the cache lock.")
                     .font(.caption2).foregroundStyle(.orange).padding(.horizontal, 12).padding(.bottom, 8)
@@ -178,13 +186,14 @@ struct CleanupDashboardView: View {
                 else if let estimate = inventory.dockerEstimate {
                     if estimate > 0 {
                         Text("Up to \(ByteFormatting.string(estimate))").font(.caption.monospacedDigit()).foregroundStyle(SiftChartStyle.secondaryText)
-                        Button("Clean…") { onDocker() }.buttonStyle(SiftQuietButtonStyle()).disabled(isCleaning)
+                        Button("Clean…") { onDocker() }.buttonStyle(SiftQuietButtonStyle())
                     } else { Text("Empty").font(.caption2).foregroundStyle(SiftChartStyle.mutedText) }
                 }
             }
             if case let .unavailable(message) = inventory.docker {
                 Text(message).font(.caption2).foregroundStyle(SiftChartStyle.mutedText)
             }
+            if let error = cleanupErrors["docker"] { Text(error).font(.caption2).foregroundStyle(.orange) }
         }.padding(12)
     }
 }
@@ -260,7 +269,7 @@ struct CleanupObservationView: View {
                         .font(.caption.monospacedDigit())
                 } else { Text("Measurement unavailable").font(.caption).foregroundStyle(SiftChartStyle.secondaryText) }
             }
-            Text(observation.movedToTrash ? "Moving to Trash does not release space until Trash is emptied." : "Mac-wide change during cleanup; other apps can affect it.")
+            Text(observation.movedToTrash ? "Moving to Trash does not release space until Trash is emptied." : "Mac-wide change during cleanup; concurrent cleanups and other apps can affect it.")
                 .font(.caption2).foregroundStyle(SiftChartStyle.mutedText)
         }.padding(12).siftStorageSurface()
     }

@@ -129,7 +129,7 @@ final class CleanupDashboardTests: XCTestCase {
         let view = CleanupDashboardView(
             inventory: CleanupInventory(worktreeBytes: 12_000_000_000, caches: examples, docker: .available(reclaimableBytes: 1_000_000_000, detail: "Unused images")),
             observation: CleanupObservation(operation: "Example cleanup", before: 7_000_000_000, after: 7_240_000_000),
-            cleaningID: nil, cleaningDocker: false, isCleaning: false, eligibleCount: 1,
+            cleaningIDs: [], cleaningDocker: false, eligibleCount: 1,
             onClean: { _ in XCTFail("Rendering must not execute cleanup") },
             onDocker: { XCTFail("Rendering must not execute Docker cleanup") },
             onCleanEligible: { XCTFail("Rendering must not execute bulk cleanup") },

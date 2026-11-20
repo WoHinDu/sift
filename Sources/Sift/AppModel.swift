@@ -16,9 +16,14 @@ final class AppModel: ObservableObject {
     @Published var reusedCandidateSizeCount = 0
     @Published var measuredCandidateSizeCount = 0
     @Published var lastScanDuration: TimeInterval?
-    @Published var isCleaning = false
-    @Published private(set) var cleaningGlobalCacheID: String?
-    @Published private(set) var isCleaningDocker = false
+    @Published private(set) var cleanupActivity = CleanupActivity()
+    @Published private(set) var cleanupErrors: [String: String] = [:]
+    var isCleaning: Bool { !cleanupActivity.isEmpty }
+    var isCleaningDocker: Bool { cleanupActivity.jobs["docker"] != nil }
+    var isCleaningWorktrees: Bool { cleanupActivity.jobs["worktrees"] != nil }
+    var cleaningGlobalCacheIDs: Set<String> {
+        Set(cleanupActivity.jobs.keys.filter { $0.hasPrefix("cache:") }.map { String($0.dropFirst(6)) })
+    }
     @Published var lastMessage: String?
     @Published private(set) var lastCleanupObservation: CleanupObservation?
     @Published var lastSyncedAt: Date?
@@ -44,8 +49,10 @@ final class AppModel: ObservableObject {
     private let lastSyncedKey = "lastSuccessfulScanDate"
     private var rescanWhenIdle = false
     private var globalCacheRevision = 0
+    private let cleanup: CleanupExecution
 
-    init() {
+    init(cleanup: CleanupExecution = .live) {
+        self.cleanup = cleanup
         deletesImmediately = UserDefaults.standard.bool(forKey: "deleteGeneratedFoldersImmediately")
         if Bundle.main.bundleIdentifier == "com.dominikbura.sift" {
             Self.migrateLegacyDefaultsIfNeeded()
@@ -81,13 +88,37 @@ final class AppModel: ObservableObject {
     var selectedConservativeBytes: Int64 { selectedCandidates.reduce(0) { $0 + $1.conservativeBytes } }
     var cleanableGlobalCaches: [GlobalCache] {
         globalCaches.filter { cache in
-            guard cache.includedInCleanAll else { return false }
+            guard cache.includedInCleanAll, canCleanCache(cache) else { return false }
             if case let .available(bytes, _) = cache.state { return bytes > 0 }
             return false
         }
     }
     var cleanableGlobalStorageCount: Int {
-        cleanableGlobalCaches.count + (dockerState.reclaimableBytes > 0 ? 1 : 0)
+        cleanableGlobalCaches.count + (dockerState.reclaimableBytes > 0 && !isCleaningDocker ? 1 : 0)
+    }
+    func canCleanCache(_ cache: GlobalCache) -> Bool {
+        cleanupActivity.canStart("cache:" + cache.id, paths: cache.state.path.map { [$0] } ?? [])
+    }
+    var canCleanSelected: Bool {
+        !selectedCandidates.isEmpty && cleanupActivity.canStart("worktrees", paths: selectedCandidates.map { $0.url.path })
+    }
+    @discardableResult private func beginCleanup(_ id: String, paths: [String] = []) -> Bool {
+        guard cleanupActivity.begin(id, paths: paths) else { return false }
+        cleanupErrors[id] = nil
+        globalCacheRevision += 1
+        if isScanning { rescanWhenIdle = true }
+        return true
+    }
+    private func finishCleanup(_ id: String, needsRescan: Bool = false) {
+        if cleanupActivity.jobs[id]?.overlapped == true, let message = lastMessage {
+            lastMessage = message + " Free-space changes include concurrent cleanups and other app activity."
+        }
+        cleanupActivity.finish(id)
+        if needsRescan { rescanWhenIdle = true }
+        if rescanWhenIdle, !isCleaning, !isScanning {
+            rescanWhenIdle = false
+            scan(inBackground: true, preservingMessage: true)
+        }
     }
     var applicationName: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "Sift"
@@ -175,9 +206,10 @@ final class AppModel: ObservableObject {
                 scanner: scanner,
                 existing: [],
                 previousByPath: previousByPath,
-                publishesProgressively: !inBackground
+                publishesProgressively: !inBackground,
+                revision: cacheRevision
             )
-            if !refreshed.isEmpty { scanCache.save(refreshed) }
+            if !refreshed.isEmpty, globalCacheRevision == cacheRevision { scanCache.save(refreshed) }
             let knownPaths = Set(knownWorkspaceURLs.map(\.path))
             let generalWorkspaceURLs = await generalDiscovery.value.filter { !knownPaths.contains($0.path) }
             discoveredWorkspaceCount += generalWorkspaceURLs.count
@@ -186,17 +218,23 @@ final class AppModel: ObservableObject {
                 scanner: scanner,
                 existing: refreshed,
                 previousByPath: previousByPath,
-                publishesProgressively: !inBackground
+                publishesProgressively: !inBackground,
+                revision: cacheRevision
             )
 
-            workspaces = refreshed
-            selectedCandidateIDs.formIntersection(refreshed.flatMap(\.candidates).map(\.id))
-            scanCache.save(refreshed)
-            dockerState = await refreshedDockerState
+            if globalCacheRevision == cacheRevision {
+                workspaces = refreshed
+                selectedCandidateIDs.formIntersection(refreshed.flatMap(\.candidates).map(\.id))
+                scanCache.save(refreshed)
+            }
+            let refreshedDocker = await refreshedDockerState
+            if globalCacheRevision == cacheRevision { dockerState = refreshedDocker }
             await globalRefresh.value
             let completedAt = Date()
-            lastSyncedAt = completedAt
-            UserDefaults.standard.set(completedAt, forKey: lastSyncedKey)
+            if globalCacheRevision == cacheRevision {
+                lastSyncedAt = completedAt
+                UserDefaults.standard.set(completedAt, forKey: lastSyncedKey)
+            }
             let elapsed = scanStartedAt.duration(to: .now)
             lastScanDuration = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
             isScanning = false
@@ -224,7 +262,8 @@ final class AppModel: ObservableObject {
         scanner: WorkspaceScanner,
         existing: [Workspace],
         previousByPath: [String: Workspace],
-        publishesProgressively: Bool
+        publishesProgressively: Bool,
+        revision: Int
     ) async -> [Workspace] {
         var refreshed = existing
         await withTaskGroup(of: WorkspaceScanResult.self) { group in
@@ -242,7 +281,7 @@ final class AppModel: ObservableObject {
                 measuredCandidateSizeCount += result.measuredSizeCount
                 if !workspace.candidates.isEmpty {
                     refreshed.append(workspace)
-                    if publishesProgressively {
+                    if publishesProgressively, globalCacheRevision == revision, !isCleaning {
                         workspaces = refreshed.sorted {
                             if $0.reclaimableBytes == $1.reclaimableBytes { return $0.name < $1.name }
                             return $0.reclaimableBytes > $1.reclaimableBytes
@@ -259,8 +298,7 @@ final class AppModel: ObservableObject {
 
     func cleanSelected() {
         let selected = selectedCandidates
-        guard !selected.isEmpty, !isCleaning else { return }
-        isCleaning = true
+        guard !selected.isEmpty, beginCleanup("worktrees", paths: selected.map { $0.url.path }) else { return }
         let cleaner = cleaner
         let currentWorkspaces = workspaces
         let mode: CleanupMode = deletesImmediately ? .deleteImmediately : .trash
@@ -291,13 +329,15 @@ final class AppModel: ObservableObject {
                 lastMessage = "Moved \(result.trashed.count) folders to Trash; \(result.failed.count) could not be moved."
             }
             recordCleanupObservation("Worktree folders", before: before, movedToTrash: mode == .trash && !result.trashedURLs.isEmpty)
-            isCleaning = false
-            if isScanning {
-                rescanWhenIdle = true
-            } else {
-                rescanWhenIdle = false
-                scan(preservingMessage: true)
+            selectedCandidateIDs.subtract(result.trashed.map(\.id))
+            let removed = Set(result.trashed.map(\.id))
+            workspaces = workspaces.map { workspace in
+                Workspace(url: workspace.url, name: workspace.name, branch: workspace.branch,
+                          repositoryID: workspace.repositoryID, repositoryName: workspace.repositoryName,
+                          candidates: workspace.candidates.filter { !removed.contains($0.id) })
             }
+            scanCache.save(workspaces)
+            finishCleanup("worktrees", needsRescan: true)
         }
     }
 
@@ -310,44 +350,43 @@ final class AppModel: ObservableObject {
     }
 
     func pruneDockerImages() {
-        guard !isCleaning else { return }
-        isCleaning = true
-        isCleaningDocker = true
-        let docker = docker
+        guard beginCleanup("docker") else { return }
+        let cleanup = cleanup
         let before = Self.diskSpaceSnapshot().available
         Task {
+            let message: String
             do {
-                let output = try await Task.detached(priority: .userInitiated) { try docker.pruneUnusedData() }.value
+                let output = try await Task.detached(priority: .userInitiated) { try await cleanup.pruneDocker() }.value
                 refreshDiskSpace(cleanupEvent: true)
                 let hostFreed = max(0, (availableDiskBytes ?? before ?? 0) - (before ?? availableDiskBytes ?? 0))
                 let dockerFreed = DockerService.reclaimedBytes(fromPruneOutput: output)
                 recordCleanupObservation("Docker", before: before)
                 let dockerReport = dockerFreed.map { "Docker reports \(ByteFormatting.string($0)) reclaimed" } ?? "Docker cleanup completed"
-                lastMessage = hostFreed > 0
+                message = hostFreed > 0
                     ? "\(dockerReport) · macOS free space increased by \(ByteFormatting.string(hostFreed))."
                     : "\(dockerReport); Docker's VM disk may release macOS space later."
             } catch {
-                lastMessage = "Docker cleanup failed: \(error.localizedDescription)"
+                message = "Docker cleanup failed: \(error.localizedDescription)"
+                cleanupErrors["docker"] = error.localizedDescription
             }
-            isCleaning = false
-            isCleaningDocker = false
-            scan(preservingMessage: true)
+            dockerState = await Task.detached(priority: .utility) { await cleanup.inspectDocker() }.value
+            lastMessage = message
+            finishCleanup("docker")
         }
     }
 
     func cleanGlobalCache(_ cache: GlobalCache) {
-        guard !isCleaning else { return }
-        globalCacheRevision += 1
-        isCleaning = true
-        cleaningGlobalCacheID = cache.id
+        guard let cache = globalCaches.first(where: { $0.id == cache.id }),
+              case .available = cache.state,
+              beginCleanup("cache:" + cache.id, paths: cache.state.path.map { [$0] } ?? []) else { return }
         lastMessage = "Cleaning \(cache.name)…"
         replaceGlobalCache(cache, state: .checking)
-        let service = globalCacheService
+        let cleanup = cleanup
         let before = Self.diskSpaceSnapshot().available
         Task {
             do {
-                try await Task.detached(priority: .userInitiated) { try service.clean(id: cache.id) }.value
-                let refreshed = await Task.detached(priority: .utility) { service.inspect(id: cache.id) }.value
+                try await Task.detached(priority: .userInitiated) { try await cleanup.cleanCache(cache.id) }.value
+                let refreshed = await Task.detached(priority: .utility) { await cleanup.inspectCache(cache.id) }.value
                 if let refreshed { replaceGlobalCache(refreshed) }
                 else { replaceGlobalCache(cache, state: .failed("Cleanup finished, but the cache could not be remeasured")) }
                 let remainingBytes = refreshed?.measuredBytes
@@ -369,23 +408,22 @@ final class AppModel: ObservableObject {
                 }
                 recordCleanupObservation(cache.name, before: before)
             } catch {
-                lastMessage = "\(cache.name) cleanup failed: \(error.localizedDescription)"
-                if let refreshed = await Task.detached(priority: .utility, operation: { service.inspect(id: cache.id) }).value {
+                cleanupErrors["cache:" + cache.id] = error.localizedDescription
+                if let refreshed = await Task.detached(priority: .utility, operation: { await cleanup.inspectCache(cache.id) }).value {
                     replaceGlobalCache(refreshed)
                 } else {
                     replaceGlobalCache(cache, state: .failed(error.localizedDescription))
                 }
+                lastMessage = "\(cache.name) cleanup failed: \(error.localizedDescription)"
             }
-            cleaningGlobalCacheID = nil
-            isCleaning = false
+            finishCleanup("cache:" + cache.id)
         }
     }
 
     func stopUVLockProcesses() {
-        guard !isCleaning else { return }
-        globalCacheRevision += 1
-        isCleaning = true
-        cleaningGlobalCacheID = "uv"
+        let uvCache = globalCaches.first(where: { $0.id == "uv" })
+        guard let uvCache, case .blocked = uvCache.state else { return }
+        guard beginCleanup("cache:uv", paths: uvCache.state.path.map { [$0] } ?? []) else { return }
         lastMessage = "Stopping uv processes…"
         let processService = uvLockProcessService
         let cacheService = globalCacheService
@@ -393,90 +431,33 @@ final class AppModel: ObservableObject {
         if let cache = globalCaches.first(where: { $0.id == "uv" }), case let .blocked(_, path, _) = cache.state { uvPath = path }
         else { uvPath = nil }
         Task {
+            let message: String
             do {
                 let count = try await Task.detached(priority: .userInitiated) {
                     try processService.stopHolders(cachePath: uvPath)
                 }.value
-                lastMessage = count == 0
+                message = count == 0
                     ? "No uv processes are holding the cache lock."
                     : "Stopped \(count) uv process\(count == 1 ? "" : "es"). Their development servers and commands were terminated."
             } catch {
-                lastMessage = "Could not stop uv processes: \(error.localizedDescription)"
+                message = "Could not stop uv processes: \(error.localizedDescription)"
+                cleanupErrors["cache:uv"] = error.localizedDescription
             }
             if let refreshed = await Task.detached(priority: .utility, operation: { cacheService.inspect(id: "uv") }).value {
                 replaceGlobalCache(refreshed)
             }
-            cleaningGlobalCacheID = nil
-            isCleaning = false
+            lastMessage = message
+            finishCleanup("cache:uv")
         }
     }
 
     func cleanAllGlobalCaches() {
+        // Each source reserves its own paths synchronously before launching.
+        // This uses the same revalidation/confirmation scope as individual jobs.
         let caches = cleanableGlobalCaches
-        let cleansDocker = dockerState.reclaimableBytes > 0
-        guard (!caches.isEmpty || cleansDocker), !isCleaning else { return }
-        globalCacheRevision += 1
-        isCleaning = true
-        lastMessage = "Cleaning Docker and global caches…"
-        let service = globalCacheService
-        let docker = docker
-        let before = Self.diskSpaceSnapshot().available
-
-        Task {
-            var succeeded = 0
-            var failed = 0
-            var failedNames: [String] = []
-
-            if cleansDocker {
-                isCleaningDocker = true
-                do {
-                    _ = try await Task.detached(priority: .userInitiated) { try docker.pruneUnusedData() }.value
-                    let refreshedDocker = await Task.detached(priority: .utility) { docker.status() }.value
-                    dockerState = refreshedDocker
-                    succeeded += 1
-                } catch {
-                    failed += 1
-                    failedNames.append("Docker")
-                    dockerState = await Task.detached(priority: .utility) { docker.status() }.value
-                }
-                isCleaningDocker = false
-            }
-
-            for cache in caches {
-                cleaningGlobalCacheID = cache.id
-                replaceGlobalCache(cache, state: .checking)
-                do {
-                    try await Task.detached(priority: .userInitiated) { try service.clean(id: cache.id) }.value
-                    let refreshed = await Task.detached(priority: .utility) { service.inspect(id: cache.id) }.value
-                    if let refreshed {
-                        replaceGlobalCache(refreshed)
-                    } else {
-                        replaceGlobalCache(cache, state: .failed("Cleanup finished, but the cache could not be remeasured"))
-                    }
-                    succeeded += 1
-                } catch {
-                    failed += 1
-                    failedNames.append(cache.name)
-                    if let refreshed = await Task.detached(priority: .utility, operation: { service.inspect(id: cache.id) }).value {
-                        replaceGlobalCache(refreshed)
-                    } else {
-                        replaceGlobalCache(cache, state: .failed(error.localizedDescription))
-                    }
-                }
-            }
-
-            cleaningGlobalCacheID = nil
-            try? await Task.sleep(for: .milliseconds(300))
-            refreshDiskSpace(cleanupEvent: true)
-            let freeSpaceIncrease = max(0, (availableDiskBytes ?? before ?? 0) - (before ?? availableDiskBytes ?? 0))
-            let failureText = failed > 0 ? "; \(failed) failed (\(failedNames.joined(separator: ", ")))" : ""
-            let diskText = freeSpaceIncrease > 0
-                ? "macOS free space increased by \(ByteFormatting.string(freeSpaceIncrease))"
-                : "macOS reported no immediate free-space change"
-            lastMessage = "Cleanup commands completed for \(succeeded) source\(succeeded == 1 ? "" : "s")\(failureText) · \(diskText)."
-            recordCleanupObservation("Eligible caches", before: before)
-            isCleaning = false
-        }
+        let cleansDocker = dockerState.reclaimableBytes > 0 && !isCleaningDocker
+        for cache in caches { cleanGlobalCache(cache) }
+        if cleansDocker { pruneDockerImages() }
     }
 
     private func recordCleanupObservation(_ operation: String, before: Int64?, movedToTrash: Bool = false) {
