@@ -176,7 +176,10 @@ struct GlobalCache: Identifiable, Equatable, Sendable {
     /// data to download again, so bulk cleanup leaves it for individual review.
     /// Prune-only sources keep what is in use and are unaffected.
     func skippedByBulkCleanup(now: Date = Date()) -> Bool {
-        !onlyPrunesUnusedData && changedRecently(now: now)
+        // Leftovers with their own age rule (update downloads, job logs) are
+        // not caches in use: whatever is still recent was already left out.
+        if RegenerableCacheService.definition(id: id)?.minimumAge != nil { return false }
+        return !onlyPrunesUnusedData && changedRecently(now: now)
     }
     func lastChangedLabel(now: Date = Date()) -> String? {
         guard let lastChanged, bytes > 0 else { return nil }

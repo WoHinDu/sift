@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Folder-attributed size plus the newest modification date found inside.
@@ -15,47 +16,52 @@ struct DirectoryMeasurement: Equatable, Sendable {
 
     /// Returns nil when any part of the tree could not be read, so a partial
     /// total is never presented as a measured size. A missing path measures as empty.
-    static func measure(_ url: URL, now: Date = Date(), fileManager: FileManager = .default) -> DirectoryMeasurement? {
-        let keys: Set<URLResourceKey> = [
-            .isRegularFileKey,
-            .isDirectoryKey,
-            .isSymbolicLinkKey,
-            .fileAllocatedSizeKey,
-            .totalFileAllocatedSizeKey,
-            .contentModificationDateKey
-        ]
-        guard let root = try? url.resourceValues(forKeys: keys) else {
-            return fileManager.fileExists(atPath: url.path) ? nil : DirectoryMeasurement()
-        }
+    ///
+    /// Walks with fts(3), the same traversal `du` uses: one `lstat` per entry and
+    /// no per-file URL objects, which matters for caches holding hundreds of
+    /// thousands of small files. Symbolic links are never followed and the walk
+    /// stays on one volume.
+    static func measure(_ url: URL, now: Date = Date()) -> DirectoryMeasurement? {
+        var rootInfo = stat()
+        guard lstat(url.path, &rootInfo) == 0 else { return errno == ENOENT ? DirectoryMeasurement() : nil }
+        guard let path = strdup(url.path) else { return nil }
+        defer { free(path) }
+        let arguments: [UnsafeMutablePointer<CChar>?] = [path, nil]
+        guard let stream = arguments.withUnsafeBufferPointer({ fts_open($0.baseAddress!, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, nil) }) else { return nil }
+        defer { fts_close(stream) }
+
         var result = DirectoryMeasurement()
+        var failed = false
         // Dates in the future come from broken clocks or archives; ignoring them
         // keeps one odd file from marking a cache as permanently in use.
-        let latestPlausibleDate = now.addingTimeInterval(60)
-        func record(_ values: URLResourceValues) {
-            guard values.isSymbolicLink != true else { return }
-            if values.isRegularFile == true {
-                result.bytes += Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
+        let latestPlausible = Int(now.timeIntervalSince1970) + 60
+        var newest = Int.min
+        var countedLinks = Set<FileIdentity>()
+        while let entry = fts_read(stream) {
+            switch Int32(entry.pointee.fts_info) {
+            case FTS_F:
+                guard let info = entry.pointee.fts_statp?.pointee else { failed = true; continue }
+                // A file hard-linked twice inside the tree occupies its blocks once.
+                if info.st_nlink > 1, !countedLinks.insert(FileIdentity(device: info.st_dev, inode: info.st_ino)).inserted { continue }
+                result.bytes += Int64(info.st_blocks) * 512
+                if info.st_mtimespec.tv_sec <= latestPlausible { newest = max(newest, info.st_mtimespec.tv_sec) }
+            case FTS_D:
+                guard let info = entry.pointee.fts_statp?.pointee else { failed = true; continue }
+                if info.st_mtimespec.tv_sec <= latestPlausible { newest = max(newest, info.st_mtimespec.tv_sec) }
+            case FTS_DNR, FTS_ERR, FTS_NS:
+                failed = true
+            default:
+                break // Post-order directories, symbolic links, and special files.
             }
-            guard values.isRegularFile == true || values.isDirectory == true,
-                  let date = values.contentModificationDate, date <= latestPlausibleDate,
-                  date > (result.newestChange ?? .distantPast) else { return }
-            result.newestChange = date
         }
-        record(root)
-        // A symbolic link is never followed: only its own entry is counted.
-        guard root.isDirectory == true, root.isSymbolicLink != true else { return result }
-
-        var failed = false
-        guard let enumerator = fileManager.enumerator(
-            at: url,
-            includingPropertiesForKeys: Array(keys),
-            options: [],
-            errorHandler: { _, _ in failed = true; return true }
-        ) else { return nil }
-        while let item = enumerator.nextObject() as? URL {
-            guard let values = try? item.resourceValues(forKeys: keys) else { failed = true; continue }
-            record(values)
-        }
+        // fts_read sets errno to 0 when the whole hierarchy was returned.
+        if errno != 0 { failed = true }
+        if newest != Int.min { result.newestChange = Date(timeIntervalSince1970: TimeInterval(newest)) }
         return failed ? nil : result
+    }
+
+    private struct FileIdentity: Hashable {
+        let device: dev_t
+        let inode: ino_t
     }
 }

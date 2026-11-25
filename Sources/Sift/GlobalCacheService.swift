@@ -43,18 +43,35 @@ struct GlobalCacheService: Sendable {
     }
 
     func inspectAll(onResult: @Sendable (GlobalCache) -> Void = { _ in }) -> [GlobalCache] {
-        var results: [GlobalCache] = []
-        for definition in definitions {
-            guard let cache = inspect(definition) else { continue }
-            results.append(cache); onResult(cache)
-            if definition.id == "pnpm", let others = inspectOtherPnpmStores(activePath: cache.state.path) {
-                results.append(others); onResult(others)
+        // File-based sources are independent directory walks, so a few workers
+        // measure them while the package-manager commands run one after another.
+        // This keeps the inventory from slowing down as more sources are supported.
+        let fileBased = RegenerableCacheService.definitions
+        let slots = InspectionSlots(count: fileBased.count)
+        let regenerableCaches = regenerableCaches
+        return withoutActuallyEscaping(onResult) { onResult in
+            let fileBasedWork = DispatchGroup()
+            DispatchQueue.global(qos: .utility).async(group: fileBasedWork) {
+                DispatchQueue.concurrentPerform(iterations: min(3, fileBased.count)) { _ in
+                    while let index = slots.claimNext() {
+                        guard let cache = regenerableCaches.inspect(fileBased[index]) else { continue }
+                        slots.store(cache, at: index)
+                        onResult(cache)
+                    }
+                }
             }
+            var results: [GlobalCache] = []
+            for definition in definitions {
+                guard let cache = inspect(definition) else { continue }
+                results.append(cache); onResult(cache)
+                if definition.id == "pnpm", let others = inspectOtherPnpmStores(activePath: cache.state.path) {
+                    results.append(others); onResult(others)
+                }
+            }
+            // The callback must not outlive this call.
+            fileBasedWork.wait()
+            return results + slots.caches
         }
-        for definition in RegenerableCacheService.definitions {
-            if let cache = regenerableCaches.inspect(definition) { results.append(cache); onResult(cache) }
-        }
-        return results
     }
 
     func inspect(id: String) -> GlobalCache? {
@@ -309,6 +326,30 @@ struct GlobalCacheService: Sendable {
             return "Cache is in use by another uv process"
         }
         return "Cleanup command failed"
+    }
+}
+
+/// Hands out definition indexes to concurrent workers and keeps results in definition order.
+private final class InspectionSlots: @unchecked Sendable {
+    private let lock = NSLock()
+    private var next = 0
+    private var stored: [GlobalCache?]
+
+    init(count: Int) { stored = Array(repeating: nil, count: count) }
+
+    func claimNext() -> Int? {
+        lock.lock(); defer { lock.unlock() }
+        guard next < stored.count else { return nil }
+        defer { next += 1 }
+        return next
+    }
+    func store(_ cache: GlobalCache, at index: Int) {
+        lock.lock(); defer { lock.unlock() }
+        stored[index] = cache
+    }
+    var caches: [GlobalCache] {
+        lock.lock(); defer { lock.unlock() }
+        return stored.compactMap { $0 }
     }
 }
 

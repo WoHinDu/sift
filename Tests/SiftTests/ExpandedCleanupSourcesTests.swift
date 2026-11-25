@@ -210,6 +210,13 @@ final class ExpandedCleanupSourcesTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(measurement.bytes, 3 * 4096)
         XCTAssertEqual(try XCTUnwrap(measurement.newestChange).timeIntervalSince1970, newer.timeIntervalSince1970, accuracy: 2)
         XCTAssertEqual(DirectoryMeasurement.measure(home.appendingPathComponent("missing")), DirectoryMeasurement())
+
+        // A file linked twice inside the tree is counted once, and a link is never followed.
+        try write("outside/large.bin", bytes: 64 * 1024)
+        let single = try XCTUnwrap(DirectoryMeasurement.measure(home.appendingPathComponent("cache"), now: now)).bytes
+        try files.linkItem(at: home.appendingPathComponent("cache/a/old.bin"), to: home.appendingPathComponent("cache/b/hardlink.bin"))
+        try files.createSymbolicLink(at: home.appendingPathComponent("cache/a/link"), withDestinationURL: home.appendingPathComponent("outside"))
+        XCTAssertEqual(DirectoryMeasurement.measure(home.appendingPathComponent("cache"), now: now)?.bytes, single)
     }
 
     // MARK: - pnpm stores
@@ -245,6 +252,8 @@ final class ExpandedCleanupSourcesTests: XCTestCase {
         XCTAssertFalse(cache("uv", changedDaysAgo: 30).skippedByBulkCleanup(now: now))
         XCTAssertFalse(cache("uv", changedDaysAgo: nil).skippedByBulkCleanup(now: now), "An unknown age never hides a source")
         XCTAssertFalse(cache("homebrew", changedDaysAgo: 0).skippedByBulkCleanup(now: now), "Pruning keeps what is in use")
+        XCTAssertFalse(cache("app-updaters", changedDaysAgo: 5).skippedByBulkCleanup(now: now), "Leftovers follow their own 24-hour rule")
+        XCTAssertFalse(cache("azcopy-logs", changedDaysAgo: 5).skippedByBulkCleanup(now: now))
         XCTAssertEqual(cache("uv", changedDaysAgo: 3).lastChangedLabel(now: now), "Changed 3 days ago")
         XCTAssertNil(cache("uv", changedDaysAgo: nil).lastChangedLabel(now: now))
     }

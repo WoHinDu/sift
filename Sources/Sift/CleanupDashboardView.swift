@@ -175,6 +175,8 @@ struct CleanupDashboardView: View {
                     if cache.lastChangedLabel() != nil { Text("Age is the newest modification date in the cache, not last use.") }
                     if case let .failed(message) = cache.state { Text(message).foregroundStyle(.orange) }
                 }.font(.caption2).foregroundStyle(SiftChartStyle.secondaryText)
+                    // Explanations wrap instead of truncating when the panel is short.
+                    .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 12).padding(.bottom, 12)
             }
         }
