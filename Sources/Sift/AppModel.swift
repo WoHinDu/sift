@@ -88,7 +88,7 @@ final class AppModel: ObservableObject {
     var selectedConservativeBytes: Int64 { selectedCandidates.reduce(0) { $0 + $1.conservativeBytes } }
     var cleanableGlobalCaches: [GlobalCache] {
         globalCaches.filter { cache in
-            guard cache.includedInCleanAll, canCleanCache(cache) else { return false }
+            guard cache.includedInCleanAll, !cache.skippedByBulkCleanup(), canCleanCache(cache) else { return false }
             if case let .available(bytes, _) = cache.state { return bytes > 0 }
             return false
         }
@@ -388,8 +388,12 @@ final class AppModel: ObservableObject {
                 try await Task.detached(priority: .userInitiated) { try await cleanup.cleanCache(cache.id) }.value
                 let refreshed = await Task.detached(priority: .utility) { await cleanup.inspectCache(cache.id) }.value
                 if let refreshed { replaceGlobalCache(refreshed) }
+                else if cache.disappearsWhenEmpty, let path = cache.state.path {
+                    // The source removes whole folders, so finding nothing afterwards is success.
+                    replaceGlobalCache(cache, state: .available(bytes: 0, path: path))
+                }
                 else { replaceGlobalCache(cache, state: .failed("Cleanup finished, but the cache could not be remeasured")) }
-                let remainingBytes = refreshed?.measuredBytes
+                let remainingBytes = refreshed?.measuredBytes ?? (cache.disappearsWhenEmpty ? 0 : nil)
                 let removedFromCache = remainingBytes.map { max(0, cache.bytes - $0) }
                 try? await Task.sleep(for: .milliseconds(300))
                 refreshDiskSpace(cleanupEvent: true)
@@ -478,7 +482,8 @@ final class AppModel: ObservableObject {
             name: cache.name,
             detail: cache.detail,
             symbolName: cache.symbolName,
-            state: state
+            state: state,
+            lastChanged: state == .checking ? cache.lastChanged : nil
         ))
     }
 
