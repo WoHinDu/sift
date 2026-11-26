@@ -453,9 +453,7 @@ struct ContentView: View {
                             updateRow
                             Text("Sift checks for updates without sending telemetry or storage data.")
                                 .font(.caption2).foregroundStyle(SiftChartStyle.mutedText)
-                        }
-
-                        Divider()
+                        }.siftSettingsCard()
 
                         VStack(alignment: .leading, spacing: 9) {
                             Text("MAC STORAGE").font(.caption.weight(.semibold)).foregroundStyle(SiftChartStyle.secondaryText)
@@ -467,9 +465,7 @@ struct ContentView: View {
                             .buttonStyle(SiftQuietButtonStyle())
                             Text("See your Mac’s storage breakdown and Apple’s storage recommendations.")
                                 .font(.caption2).foregroundStyle(SiftChartStyle.mutedText)
-                        }
-
-                        Divider()
+                        }.siftSettingsCard()
 
                         VStack(alignment: .leading, spacing: 10) {
                             Text("WORKTREE CLEANUP").font(.caption.weight(.semibold)).foregroundStyle(SiftChartStyle.secondaryText)
@@ -490,9 +486,7 @@ struct ContentView: View {
                                 Label("Permanent deletion cannot be undone. Workspace roots, source files, and .git remain protected.", systemImage: "exclamationmark.triangle.fill")
                                     .font(.caption2).foregroundStyle(.orange)
                             }
-                        }
-
-                        Divider()
+                        }.siftSettingsCard()
 
                         VStack(alignment: .leading, spacing: 10) {
                             HStack {
@@ -512,7 +506,7 @@ struct ContentView: View {
                                     .buttonStyle(.plain).help("Stop scanning this folder")
                                 }
                             }
-                        }
+                        }.siftSettingsCard()
 
                         Label(model.deletesImmediately ? "Generated worktree folders are deleted permanently. Global cache commands are also permanent." : "Generated worktree folders move to Trash. Global cache commands are permanent and always require confirmation.", systemImage: "lock.shield.fill")
                             .font(.caption2).foregroundStyle(SiftChartStyle.mutedText)
@@ -537,7 +531,13 @@ struct ContentView: View {
                 .padding(.vertical, 12)
             }
             .frame(width: 390)
-            .siftGlassSurface(cornerRadius: 18, interactive: false)
+            .background(SiftSettingsStyle.content)
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .strokeBorder(SiftSettingsStyle.border, lineWidth: 1)
+                    .allowsHitTesting(false)
+            }
             .shadow(color: .black.opacity(0.35), radius: 24, y: 12)
             .padding(.leading, 16)
             .padding(.bottom, 58)
