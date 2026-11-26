@@ -62,6 +62,17 @@ VM disks, personal files, downloads, and agent conversations are inspectable in 
 
 ## Install
 
+### Homebrew
+
+```bash
+brew tap dominik-bura/sift
+brew install --cask dominik-bura/sift/sift
+```
+
+See [Homebrew release setup](docs/homebrew-releases.md) for the dedicated-tap configuration.
+
+### Direct download
+
 1. Download the latest `Sift-*.dmg` from [GitHub Releases](https://github.com/dominik-bura/sift/releases/latest).
 2. Open the disk image and drag **Sift** onto the **Applications** shortcut.
 3. Eject the disk image, then open Sift from Applications. Its funnel icon will appear in the menu bar.

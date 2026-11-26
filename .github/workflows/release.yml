@@ -22,6 +22,8 @@ jobs:
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      HAS_HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+      HOMEBREW_TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
     steps:
       - name: Check out source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5, Node.js 24
@@ -68,7 +70,9 @@ jobs:
           echo "SIFT_CODESIGN_IDENTITY=${APPLE_SIGNING_IDENTITY}" >> "${GITHUB_ENV}"
 
       - name: Run tests
-        run: swift test
+        run: |
+          bash scripts/test-generate-cask.sh
+          swift test
 
       - name: Build release
         env:
@@ -149,6 +153,15 @@ jobs:
           shasum -a 256 "dist/DevSweep-${VERSION}.zip" > "dist/DevSweep-${VERSION}.zip.sha256"
           shasum -a 256 "dist/Sift-${VERSION}.dmg" > "dist/Sift-${VERSION}.dmg.sha256"
 
+      - name: Generate Homebrew cask
+        env:
+          VERSION: 0.1.${{ github.run_number }}
+        run: |
+          sha="$(shasum -a 256 "dist/Sift-${VERSION}.dmg" | awk '{print $1}')"
+          signing="signed"; [[ "${SIGNED_RELEASE}" == "true" ]] || signing="unsigned"
+          bash scripts/generate-cask.sh "${VERSION}" "${sha}" "${GITHUB_REPOSITORY}" "${signing}" > "${RUNNER_TEMP}/sift.rb"
+          ruby -c "${RUNNER_TEMP}/sift.rb"
+
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -169,3 +182,27 @@ jobs:
               --target "${GITHUB_SHA}" \
               "${notes[@]}"
           fi
+
+      - name: Update Homebrew tap
+        if: ${{ env.HAS_HOMEBREW_TAP_TOKEN == 'true' && env.HOMEBREW_TAP_REPOSITORY != '' }}
+        env:
+          VERSION: 0.1.${{ github.run_number }}
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          [[ "${HOMEBREW_TAP_REPOSITORY}" =~ ^[A-Za-z0-9_.-]+/homebrew-[A-Za-z0-9_.-]+$ ]] || { echo "Invalid tap repository" >&2; exit 1; }
+          tap_dir="$(mktemp -d "${RUNNER_TEMP}/sift-tap.XXXXXX")"
+          # Keep credentials out of the remote URL and repository configuration.
+          git -c credential.helper= -c 'credential.helper=!gh auth git-credential' clone --depth 1 "https://github.com/${HOMEBREW_TAP_REPOSITORY}.git" "${tap_dir}"
+          mkdir -p "${tap_dir}/Casks"
+          cp "${RUNNER_TEMP}/sift.rb" "${tap_dir}/Casks/sift.rb"
+          cd "${tap_dir}"
+          git add Casks/sift.rb
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "sift ${VERSION}"
+          git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push
+
+      - name: Report missing Homebrew configuration
+        if: ${{ env.HAS_HOMEBREW_TAP_TOKEN != 'true' || env.HOMEBREW_TAP_REPOSITORY == '' }}
+        run: echo '::warning::Homebrew tap was not updated. Configure HOMEBREW_TAP_REPOSITORY and a tap-scoped HOMEBREW_TAP_TOKEN.'
