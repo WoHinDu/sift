@@ -141,7 +141,7 @@ final class ExpandedCleanupSourcesTests: XCTestCase {
         try files.createSymbolicLink(at: home.appendingPathComponent("Library/Application Support/App/Partitions/linked"),
                                      withDestinationURL: home.appendingPathComponent("Elsewhere"))
 
-        XCTAssertEqual(service().matches(definition.targets[0]).map { $0.deletingLastPathComponent().lastPathComponent }, ["one", "two"])
+        XCTAssertEqual(try service().matches(definition.targets[0]).map { $0.deletingLastPathComponent().lastPathComponent }, ["one", "two"])
         try service().clean(definition)
         XCTAssertFalse(exists("Library/Application Support/App/Partitions/one/Cache/entry"))
         XCTAssertFalse(exists("Library/Application Support/App/Partitions/two/Cache/entry"))
@@ -231,9 +231,9 @@ final class ExpandedCleanupSourcesTests: XCTestCase {
         let store = home.appendingPathComponent("Library/pnpm/store")
         try files.createSymbolicLink(at: store.appendingPathComponent("v12"), withDestinationURL: home.appendingPathComponent("Elsewhere"))
 
-        let others = PnpmStoreLayout.otherStores(besides: store.appendingPathComponent("v10"))
+        let others = try PnpmStoreLayout.otherStores(besides: store.appendingPathComponent("v10"))
         XCTAssertEqual(others.map(\.lastPathComponent), ["v11", "v3"])
-        XCTAssertTrue(PnpmStoreLayout.otherStores(besides: store).isEmpty, "An unversioned store path has no siblings to offer")
+        XCTAssertTrue(try PnpmStoreLayout.otherStores(besides: store).isEmpty, "An unversioned store path has no siblings to offer")
         XCTAssertTrue(PnpmStoreLayout.isVersionDirectoryName("v3"))
         for name in ["v", "3", "v3a", "V3", "v-1", "version"] {
             XCTAssertFalse(PnpmStoreLayout.isVersionDirectoryName(name), name)

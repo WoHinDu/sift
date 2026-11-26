@@ -388,12 +388,8 @@ final class AppModel: ObservableObject {
                 try await Task.detached(priority: .userInitiated) { try await cleanup.cleanCache(cache.id) }.value
                 let refreshed = await Task.detached(priority: .utility) { await cleanup.inspectCache(cache.id) }.value
                 if let refreshed { replaceGlobalCache(refreshed) }
-                else if cache.disappearsWhenEmpty, let path = cache.state.path {
-                    // The source removes whole folders, so finding nothing afterwards is success.
-                    replaceGlobalCache(cache, state: .available(bytes: 0, path: path))
-                }
                 else { replaceGlobalCache(cache, state: .failed("Cleanup finished, but the cache could not be remeasured")) }
-                let remainingBytes = refreshed?.measuredBytes ?? (cache.disappearsWhenEmpty ? 0 : nil)
+                let remainingBytes = refreshed?.measuredBytes
                 let removedFromCache = remainingBytes.map { max(0, cache.bytes - $0) }
                 try? await Task.sleep(for: .milliseconds(300))
                 refreshDiskSpace(cleanupEvent: true)

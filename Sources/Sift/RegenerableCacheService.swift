@@ -117,30 +117,64 @@ struct RegenerableCacheService: Sendable {
 
     func inspectAll() -> [GlobalCache] { Self.definitions.compactMap(inspect) }
     func inspect(id: String) -> GlobalCache? { Self.definition(id: id).flatMap(inspect) }
+    func inspectAfterCleanup(id: String) -> GlobalCache? {
+        guard let definition = Self.definition(id: id) else { return nil }
+        return inspect(definition, reportEmpty: true)
+    }
 
     /// True when at least one target currently exists, without measuring it.
     func hasMatches(_ definition: RegenerableCacheDefinition) -> Bool {
-        definition.targets.contains { !matches($0).isEmpty }
+        do {
+            for target in definition.targets where !(try matches(target)).isEmpty { return true }
+            return false
+        } catch {
+            // Keep a placeholder so inspection can show the failure, not hide it.
+            return true
+        }
     }
 
     func inspect(_ definition: RegenerableCacheDefinition) -> GlobalCache? {
+        inspect(definition, reportEmpty: false)
+    }
+
+    private func inspect(_ definition: RegenerableCacheDefinition, reportEmpty: Bool) -> GlobalCache? {
         let checkedAt = now()
         var total = DirectoryMeasurement()
         var firstPath: String?
+        var retainedRecentItems = false
+        do {
         for target in definition.targets {
-            for url in matches(target) {
+            for url in try matches(target) {
                 guard validated(url, target: target) else {
                     return cache(definition, state: .failed("Cache path could not be verified"))
                 }
                 guard let measurement = DirectoryMeasurement.measure(url, now: checkedAt) else {
                     return cache(definition, state: .failed("Could not measure cache; check permissions"))
                 }
-                if isTooRecent(measurement, definition: definition, now: checkedAt) { continue }
+                if isTooRecent(measurement, definition: definition, now: checkedAt) {
+                    retainedRecentItems = true
+                    continue
+                }
                 total.add(measurement)
                 if firstPath == nil { firstPath = url.path }
             }
         }
-        guard let firstPath else { return nil }
+        } catch { return cache(definition, state: .failed("Could not enumerate cache; check permissions")) }
+        guard let firstPath else {
+            guard reportEmpty else { return nil }
+            if retainedRecentItems {
+                return cache(definition, state: .failed("Recent items were retained. No remaining stored-size measurement is available."))
+            }
+            // Zero is justified only after every target was enumerated and no
+            // matches existed, not merely because normal inspection returned nil.
+            let prefix = definition.targets.first?.pattern.split(separator: "/").prefix { !$0.contains("*") }.joined(separator: "/") ?? ""
+            return cache(definition, state: .available(bytes: 0, path: home.appendingPathComponent(prefix).path))
+        }
+        // Age-filtered inventory changes are not proof of removed bytes. Keep
+        // the post-cleanup size unknown if recent matches were left behind.
+        if reportEmpty, retainedRecentItems {
+            return cache(definition, state: .failed("Recent items were retained. No remaining stored-size measurement is available."))
+        }
         return cache(definition, state: .available(bytes: total.bytes, path: firstPath),
                      lastChanged: total.bytes > 0 ? total.newestChange : nil)
     }
@@ -159,7 +193,7 @@ struct RegenerableCacheService: Sendable {
         }
         let checkedAt = now()
         for target in definition.targets {
-            for url in matches(target) {
+            for url in try matches(target) {
                 guard validated(url, target: target) else { throw GlobalCacheError.failed("Cache path could not be safely verified") }
                 if definition.minimumAge != nil {
                     guard let measurement = DirectoryMeasurement.measure(url, now: checkedAt) else {
@@ -191,7 +225,7 @@ struct RegenerableCacheService: Sendable {
 
     /// Existing paths matching a target. Wildcard components skip symbolic links;
     /// a literal component that is a link is returned and then fails validation.
-    func matches(_ target: RegenerableCacheDefinition.Target) -> [URL] {
+    func matches(_ target: RegenerableCacheDefinition.Target) throws -> [URL] {
         var current = [home]
         for component in target.pattern.split(separator: "/").map(String.init) {
             var next: [URL] = []
@@ -200,16 +234,33 @@ struct RegenerableCacheService: Sendable {
                     next.append(base.appendingPathComponent(component))
                     continue
                 }
-                guard let children = try? FileManager.default.contentsOfDirectory(at: base, includingPropertiesForKeys: [.isSymbolicLinkKey]) else { continue }
-                for child in children.sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
-                where Self.matches(pattern: component, name: child.lastPathComponent)
-                    && (try? child.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true {
+                let values: URLResourceValues
+                do { values = try base.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]) }
+                catch where (error as? CocoaError)?.code == .fileReadNoSuchFile { continue }
+                if values.isSymbolicLink == true { throw GlobalCacheError.failed("Cache path could not be safely verified") }
+                guard values.isDirectory == true else { continue }
+                // A literal symlink ancestor must fail before enumerating it.
+                var ancestor = base.standardizedFileURL
+                while ancestor.path != home.path {
+                    guard ancestor.path.hasPrefix(home.path + "/"),
+                          try ancestor.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
+                        throw GlobalCacheError.failed("Cache path could not be safely verified")
+                    }
+                    ancestor.deleteLastPathComponent()
+                }
+                let children = try FileManager.default.contentsOfDirectory(at: base, includingPropertiesForKeys: [.isSymbolicLinkKey])
+                for child in children.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                    guard Self.matches(pattern: component, name: child.lastPathComponent) else { continue }
+                    guard try child.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else { continue }
                     next.append(base.appendingPathComponent(child.lastPathComponent))
                 }
             }
             current = next
         }
-        return current.filter { FileManager.default.fileExists(atPath: $0.path) }
+        return try current.filter { url in
+            do { _ = try url.resourceValues(forKeys: [.isSymbolicLinkKey]); return true }
+            catch where (error as? CocoaError)?.code == .fileReadNoSuchFile { return false }
+        }
     }
 
     func validated(_ url: URL, target: RegenerableCacheDefinition.Target) -> Bool {

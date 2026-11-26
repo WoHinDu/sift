@@ -79,6 +79,16 @@ struct GlobalCacheService: Sendable {
         return definitions.first(where: { $0.id == id }).flatMap(inspect) ?? regenerableCaches.inspect(id: id)
     }
 
+    func inspectAfterCleanup(id: String) -> GlobalCache? {
+        if id == Self.otherPnpmStoresID {
+            return inspectOtherPnpmStores(activePath: activePnpmStorePath(), reportEmpty: true)
+        }
+        if RegenerableCacheService.definition(id: id) != nil {
+            return regenerableCaches.inspectAfterCleanup(id: id)
+        }
+        return inspect(id: id)
+    }
+
     func installedPlaceholders() -> [GlobalCache] {
         let tools = definitions.compactMap { definition -> GlobalCache? in
             guard TrustedExecutable.find(definition.executable) != nil
@@ -273,16 +283,32 @@ struct GlobalCacheService: Sendable {
 
     /// Every pnpm major release writes a new `v<number>` store next to the old
     /// one, and `pnpm store prune` only touches the store of the pnpm that runs it.
-    private func otherPnpmStores(activePath: String?) -> [URL] {
-        guard let activePath, let active = validatedCachePath(activePath) else { return [] }
-        return PnpmStoreLayout.otherStores(besides: active).filter { validatedCachePath($0.path) != nil }
+    private func otherPnpmStores(activePath: String?) throws -> [URL] {
+        guard let activePath, let active = validatedCachePath(activePath) else {
+            throw GlobalCacheError.failed("Could not verify the active pnpm store")
+        }
+        return try PnpmStoreLayout.otherStores(besides: active).filter { validatedCachePath($0.path) != nil }
     }
 
-    private func inspectOtherPnpmStores(activePath: String?) -> GlobalCache? {
-        let stores = otherPnpmStores(activePath: activePath)
-        guard let first = stores.first else { return nil }
+    private func inspectOtherPnpmStores(activePath: String?, reportEmpty: Bool = false) -> GlobalCache? {
         let name = "Other pnpm stores"
-        let detail = "\(stores.count) store version\(stores.count == 1 ? "" : "s") the installed pnpm does not use; packages download again if a project still needs them"
+        let stores: [URL]
+        do {
+            stores = try otherPnpmStores(activePath: activePath)
+            if stores.isEmpty, reportEmpty, let activePath {
+                let active = URL(fileURLWithPath: activePath)
+                guard try PnpmStoreLayout.versionStores(besides: active).isEmpty else {
+                    throw GlobalCacheError.failed("pnpm stores with global virtual-store links were retained; remaining size is unknown")
+                }
+                return GlobalCache(id: Self.otherPnpmStoresID, name: name, detail: "No other versioned stores remain", symbolName: "shippingbox",
+                                   state: .available(bytes: 0, path: active.deletingLastPathComponent().path))
+            }
+        } catch {
+            return GlobalCache(id: Self.otherPnpmStoresID, name: name, detail: "Could not verify other pnpm stores", symbolName: "shippingbox",
+                               state: .failed(error.localizedDescription))
+        }
+        guard let first = stores.first else { return nil }
+        let detail = "\(stores.count) other store version\(stores.count == 1 ? "" : "s"); stores with global virtual-store links are excluded"
         var total = DirectoryMeasurement()
         for store in stores {
             guard let measurement = DirectoryMeasurement.measure(store) else {
@@ -298,10 +324,10 @@ struct GlobalCacheService: Sendable {
 
     private func cleanOtherPnpmStores() throws {
         guard let activePath = activePnpmStorePath() else { throw GlobalCacheError.unavailable }
-        for store in otherPnpmStores(activePath: activePath) {
+        for store in try otherPnpmStores(activePath: activePath) {
             // Recheck immediately before removal: the store must still be a real
             // versioned directory beside the active one, never the active store.
-            guard PnpmStoreLayout.otherStores(besides: URL(fileURLWithPath: activePath, isDirectory: true)).contains(store),
+            guard try PnpmStoreLayout.otherStores(besides: URL(fileURLWithPath: activePath, isDirectory: true)).contains(store),
                   validatedCachePath(store.path) != nil else {
                 throw GlobalCacheError.failed("Cache location changed during cleanup")
             }
@@ -360,15 +386,29 @@ enum PnpmStoreLayout {
 
     /// Versioned store directories beside the active one. Symbolic links and
     /// anything not named `v<number>` are never returned.
-    static func otherStores(besides active: URL, fileManager: FileManager = .default) -> [URL] {
+    static func otherStores(besides active: URL, fileManager: FileManager = .default) throws -> [URL] {
+        try versionStores(besides: active, fileManager: fileManager).filter { store in
+            // A pnpm global virtual store lives at <store>/links. Its packages
+            // may still be symlinked by projects using another pnpm version.
+            // Preserve it even if unused: we cannot prove external references.
+            do {
+                _ = try fileManager.attributesOfItem(atPath: store.appendingPathComponent("links").path)
+                return false
+            } catch where (error as? CocoaError)?.code == .fileReadNoSuchFile { return true }
+        }
+    }
+
+    static func versionStores(besides active: URL, fileManager: FileManager = .default) throws -> [URL] {
         let active = active.standardizedFileURL
         guard isVersionDirectoryName(active.lastPathComponent) else { return [] }
         let root = active.deletingLastPathComponent()
         let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey]
-        guard let entries = try? fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: keys) else { return [] }
-        return entries.filter { entry in
-            guard isVersionDirectoryName(entry.lastPathComponent), entry.lastPathComponent != active.lastPathComponent,
-                  let values = try? entry.resourceValues(forKeys: Set(keys)) else { return false }
+        let entries: [URL]
+        do { entries = try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: keys) }
+        catch where (error as? CocoaError)?.code == .fileReadNoSuchFile { return [] }
+        return try entries.filter { entry in
+            guard isVersionDirectoryName(entry.lastPathComponent), entry.lastPathComponent != active.lastPathComponent else { return false }
+            let values = try entry.resourceValues(forKeys: Set(keys))
             return values.isDirectory == true && values.isSymbolicLink != true
         }.map { root.appendingPathComponent($0.lastPathComponent, isDirectory: true).standardizedFileURL }
             .sorted { $0.path < $1.path }
